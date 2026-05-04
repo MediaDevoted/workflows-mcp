@@ -21,7 +21,7 @@ export function toolPermissionKey(toolName: string): string {
 
 const TOOL_SOURCE: Array<Omit<ToolManifestEntry, "permission_key">> = [
   { name: "workflows_list", mode: "read", requires_approval: false, description: "List workflow playbooks visible to the caller. Optional filters: connector, assignedRole, search." },
-  { name: "workflows_search", mode: "read", requires_approval: false, description: "Search workflow playbooks and locally re-rank by title/triggers/description matches." },
+  { name: "workflows_search", mode: "read", requires_approval: false, description: "Semantic search over workflow playbooks via OpenAI embeddings + pgvector. Accepts mode='fast'|'deep'." },
   { name: "workflows_read", mode: "read", requires_approval: false, description: "Read a single workflow's bodyMarkdown plus any prerequisite workflows (mustReadBefore)." },
 ];
 

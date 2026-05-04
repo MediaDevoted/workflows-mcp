@@ -18,7 +18,7 @@ Hermes Agent
 ## Tool Surface
 
 - `workflows_list({ connector?, assignedRole?, search? })` — list workflows visible to the caller.
-- `workflows_search({ query, limit? })` — search and locally re-rank by title/triggers/description matches. Default limit 5.
+- `workflows_search({ query, limit?, mode? })` — semantic search via OpenAI embeddings + pgvector cosine similarity. `mode='fast'` (default) ranks on title+description+triggers; `mode='deep'` blends in the full body. Default limit 5, max 20. Falls back to literal trigger ranking (`degraded: true`) when embeddings are unavailable.
 - `workflows_read({ slug })` — read one workflow's `bodyMarkdown` plus any prerequisite (`mustReadBefore`) workflows. Returns `{ workflow, prerequisites[], instructions }`.
 
 All three tools are read-mode and require `WORKFLOWS_READ` (admin permissions also satisfy this) plus the per-tool key (`WORKFLOWS_TOOL_LIST`, `WORKFLOWS_TOOL_SEARCH`, `WORKFLOWS_TOOL_READ`).
@@ -44,6 +44,11 @@ All three tools are read-mode and require `WORKFLOWS_READ` (admin permissions al
 | `EMPLOYEE_AUTH_CACHE_SECONDS` | `30` | introspect cache TTL. |
 | `RESPONSE_MAX_BYTES` | `200000` | Truncate large responses. |
 | `MCP_ALLOWED_TEAMS` | unset (open to all) | Optional CSV of team keys passed to skills sync. |
+| `OPENAI_API_KEY` | unset | Required to enable semantic search. When unset, `workflows_search` degrades to literal trigger ranking. |
+| `EMBEDDINGS_DB_PASSWORD` | unset | Password used by the bundled `workflows-mcp-pgvector` sidecar (compose interpolation). |
+| `EMBEDDINGS_DB_URL` | `postgres://workflows:placeholder@workflows-mcp-pgvector:5432/embeddings` | Postgres+pgvector connection string. |
+| `EMBEDDINGS_SYNC_INTERVAL_MS` | `300000` | How often the embeddings sync loop runs. |
+| `EMBEDDINGS_BATCH_SIZE` | `50` | How many workflows to embed per OpenAI batch request. |
 
 ## Dev quickstart
 

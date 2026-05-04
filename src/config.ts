@@ -18,6 +18,14 @@ export interface AgentPlatformClientConfig {
   allowedTeams: string[];
 }
 
+export interface SearchConfig {
+  openaiApiKey: string;
+  embeddingsDbUrl: string;
+  syncIntervalMs: number;
+  batchSize: number;
+  syncApiKey: string;
+}
+
 export interface ServerConfig {
   transport: "stdio" | "http";
   port: number;
@@ -25,6 +33,7 @@ export interface ServerConfig {
   responseMaxBytes: number;
   employeeApi: EmployeeApiConfig;
   agentPlatform: AgentPlatformClientConfig;
+  search: SearchConfig;
 }
 
 function env(name: string, fallback = ""): string {
@@ -71,6 +80,13 @@ export function loadConfig(): ServerConfig {
       apiKey: env("AGENT_PLATFORM_SYNC_KEY") || env("AGENT_PLATFORM_API_KEY") || env("MCP_SYNC_API_KEY") || env("EMPLOYEE_API_SERVICE_KEY") || env("EMPLOYEE_API_KEY"),
       enabled: Boolean(agentPlatformUrl),
       allowedTeams: splitCsv(env("MCP_ALLOWED_TEAMS")).map((t) => t.toUpperCase()),
+    },
+    search: {
+      openaiApiKey: env("OPENAI_API_KEY"),
+      embeddingsDbUrl: env("EMBEDDINGS_DB_URL", "postgres://workflows:placeholder@workflows-mcp-pgvector:5432/embeddings"),
+      syncIntervalMs: Number.parseInt(env("EMBEDDINGS_SYNC_INTERVAL_MS", "300000"), 10),
+      batchSize: Number.parseInt(env("EMBEDDINGS_BATCH_SIZE", "50"), 10),
+      syncApiKey: env("MCP_SYNC_API_KEY") || env("AGENT_PLATFORM_SYNC_KEY") || env("AGENT_PLATFORM_API_KEY"),
     },
   };
 }

@@ -24,10 +24,12 @@
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
+    "pg": "^8.13.1",
     "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/node": "^22.15.2",
+    "@types/pg": "^8.11.10",
     "tsx": "^4.19.4",
     "typescript": "^5.8.3"
   }

@@ -5,6 +5,9 @@ services:
     build: .
     container_name: workflows-mcp
     restart: unless-stopped
+    depends_on:
+      workflows-mcp-pgvector:
+        condition: service_healthy
     ports:
       - "${WORKFLOWS_MCP_PORT:-3030}:${WORKFLOWS_MCP_PORT:-3030}"
     environment:
@@ -26,6 +29,10 @@ services:
       WORKFLOWS_READ_PERMISSION: ${WORKFLOWS_READ_PERMISSION:-WORKFLOWS_READ}
       WORKFLOWS_WRITE_PERMISSION: ${WORKFLOWS_WRITE_PERMISSION:-MANAGE_WORKFLOWS}
       WORKFLOWS_ADMIN_PERMISSIONS: ${WORKFLOWS_ADMIN_PERMISSIONS:-MANAGE_WORKFLOWS,MANAGE_ACCESS,MANAGE_SETTINGS}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      EMBEDDINGS_DB_URL: ${EMBEDDINGS_DB_URL:-postgres://workflows:${EMBEDDINGS_DB_PASSWORD:-placeholder}@workflows-mcp-pgvector:5432/embeddings}
+      EMBEDDINGS_SYNC_INTERVAL_MS: ${EMBEDDINGS_SYNC_INTERVAL_MS:-300000}
+      EMBEDDINGS_BATCH_SIZE: ${EMBEDDINGS_BATCH_SIZE:-50}
     networks:
       - default
       - shared-internal
@@ -41,6 +48,28 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  workflows-mcp-pgvector:
+    image: pgvector/pgvector:pg17
+    container_name: workflows-mcp-pgvector
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: embeddings
+      POSTGRES_USER: workflows
+      POSTGRES_PASSWORD: ${EMBEDDINGS_DB_PASSWORD:?set EMBEDDINGS_DB_PASSWORD}
+    volumes:
+      - workflows-mcp-embeddings:/var/lib/postgresql/data
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U workflows -d embeddings"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  workflows-mcp-embeddings:
 
 networks:
   default:

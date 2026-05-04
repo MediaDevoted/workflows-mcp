@@ -13,10 +13,23 @@ import { EmployeeApiClient } from "./employee-api.js";
 import { jsonText } from "./format.js";
 import { manifestPayload, toolPermissionKey, TOOLS_MANIFEST } from "./manifest.js";
 import { employeeApiKeyFromHeaders, runWithRequestContext } from "./request-context.js";
+import {
+  EmbeddingsClient,
+  EmbeddingsStore,
+  EmbeddingsUnavailableError,
+  StoreUnavailableError,
+  SyncRunner,
+  embeddingDimensions,
+  type SearchHit,
+  type SearchMode,
+} from "./search/index.js";
 
 const config = loadConfig();
 const employeeApi = new EmployeeApiClient(config.employeeApi);
 const agentPlatform = new AgentPlatformClient(config.agentPlatform);
+
+let embeddingsClient: EmbeddingsClient | null = null;
+let embeddingsStore: EmbeddingsStore | null = null;
 
 function log(message: string): void {
   process.stderr.write(`[workflows-mcp] ${message}\n`);
@@ -242,28 +255,73 @@ operational gotchas (DNS cutovers, domain rotation, campaign launches, etc.),
 
   server.tool(
     "workflows_search",
-    "Search workflow playbooks and locally re-rank by matches across title (weight 3), triggers (weight 2), and description (weight 1). Returns the top N results (default 5).",
+    "Semantic search over workflow playbooks via OpenAI embeddings + pgvector cosine similarity. mode='fast' (default) ranks on title+description+triggers; mode='deep' blends in the full body. Falls back to literal trigger ranking when embeddings are unavailable.",
     {
       query: z.string().min(1),
-      limit: z.number().int().min(1).max(50).optional().default(5),
+      limit: z.number().int().min(1).max(20).optional().default(5),
+      mode: z.enum(["fast", "deep"]).optional().default("fast"),
     },
-    async ({ query, limit }) => governed({
+    async ({ query, limit, mode }) => governed({
       toolName: "workflows_search",
       permission: config.employeeApi.readPermission,
       action: "workflow.search",
       resourceType: "workflow",
-      metadata: { query, limit },
+      metadata: { query, limit, mode },
     }, async () => {
-      const workflows = await agentPlatform.listWorkflows({ search: query });
-      const ranked = workflows
+      const visibleWorkflows = await agentPlatform.listWorkflows();
+      const visibleSlugs = visibleWorkflows.map((w) => w.slug);
+
+      if (visibleSlugs.length === 0) {
+        return {
+          ok: true,
+          query,
+          mode,
+          total_visible: 0,
+          returned: 0,
+          results: [],
+          embedded_query_dims: embeddingDimensions,
+        };
+      }
+
+      if (embeddingsClient && embeddingsStore) {
+        try {
+          const vector = await embeddingsClient.embed(query);
+          const hits: SearchHit[] = await embeddingsStore.query({
+            embedding: vector,
+            visibleSlugs,
+            limit,
+            mode: mode as SearchMode,
+          });
+          return {
+            ok: true,
+            query,
+            mode,
+            total_visible: visibleSlugs.length,
+            returned: hits.length,
+            results: hits,
+            embedded_query_dims: embeddingDimensions,
+          };
+        } catch (error) {
+          const tag = error instanceof EmbeddingsUnavailableError
+            ? "embeddings-unavailable"
+            : error instanceof StoreUnavailableError
+              ? "store-unavailable"
+              : "search-error";
+          log(`workflows_search degraded (${tag}): ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+
+      const ranked = visibleWorkflows
         .map((workflow) => scoreWorkflow(workflow, query))
         .filter((entry) => entry.score > 0)
         .sort((a, b) => b.score - a.score)
         .slice(0, limit);
       return {
         ok: true,
+        degraded: true,
         query,
-        total_matches: workflows.length,
+        mode,
+        total_visible: visibleSlugs.length,
         returned: ranked.length,
         results: ranked,
       };
@@ -317,6 +375,34 @@ async function main(): Promise<void> {
     agentPlatform: config.agentPlatform,
     log,
   });
+
+  if (!config.search.openaiApiKey) {
+    log("semantic search disabled: OPENAI_API_KEY is not set (workflows_search will degrade to trigger ranking)");
+  } else if (!config.search.syncApiKey) {
+    log("semantic search disabled: no MCP_SYNC_API_KEY available for catalog sync");
+  } else if (!config.agentPlatform.enabled) {
+    log("semantic search disabled: AGENT_PLATFORM_URL is not set");
+  } else {
+    try {
+      embeddingsClient = new EmbeddingsClient({ apiKey: config.search.openaiApiKey });
+      embeddingsStore = new EmbeddingsStore(config.search.embeddingsDbUrl);
+      const runner = new SyncRunner({
+        agentPlatformBaseUrl: config.agentPlatform.baseUrl,
+        syncApiKey: config.search.syncApiKey,
+        store: embeddingsStore,
+        embeddings: embeddingsClient,
+        batchSize: Math.max(1, config.search.batchSize),
+        intervalMs: config.search.syncIntervalMs,
+        log,
+      });
+      runner.start();
+      log(`semantic search enabled (interval=${config.search.syncIntervalMs}ms batch=${config.search.batchSize})`);
+    } catch (error) {
+      embeddingsClient = null;
+      embeddingsStore = null;
+      log(`semantic search init failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
 
   if (config.transport === "http") {
     const sessions = new Map<string, StreamableHTTPServerTransport>();
