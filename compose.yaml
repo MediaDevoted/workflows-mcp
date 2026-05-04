@@ -1,0 +1,49 @@
+# Interpolation uses a project `.env` (local) or variables from your host / Komodo — no `env_file:` so
+# `docker compose` does not fail when `.env` is absent on the server.
+services:
+  workflows-mcp:
+    build: .
+    container_name: workflows-mcp
+    restart: unless-stopped
+    ports:
+      - "${WORKFLOWS_MCP_PORT:-3030}:${WORKFLOWS_MCP_PORT:-3030}"
+    environment:
+      NODE_ENV: production
+      WORKFLOWS_MCP_TRANSPORT: http
+      WORKFLOWS_MCP_PORT: ${WORKFLOWS_MCP_PORT:-3030}
+      WORKFLOWS_MCP_AUTH_TOKEN: ${WORKFLOWS_MCP_AUTH_TOKEN:-}
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:-}
+      RESPONSE_MAX_BYTES: ${RESPONSE_MAX_BYTES:-200000}
+      EMPLOYEE_API_URL: ${EMPLOYEE_API_URL:-http://host.docker.internal:7991}
+      EMPLOYEE_AUTH_DISABLED: ${EMPLOYEE_AUTH_DISABLED:-false}
+      EMPLOYEE_AUTH_CACHE_SECONDS: ${EMPLOYEE_AUTH_CACHE_SECONDS:-30}
+      MCP_SYNC_API_KEY: ${MCP_SYNC_API_KEY:-}
+      AGENT_PLATFORM_URL: ${AGENT_PLATFORM_URL:-http://host.docker.internal:7992}
+      AGENT_PLATFORM_SYNC_KEY: ${AGENT_PLATFORM_SYNC_KEY:-}
+      AGENT_PLATFORM_API_KEY: ${AGENT_PLATFORM_API_KEY:-}
+      AUDIT_TRAIL_URL: ${AUDIT_TRAIL_URL:-}
+      MCP_ALLOWED_TEAMS: ${MCP_ALLOWED_TEAMS:-}
+      WORKFLOWS_READ_PERMISSION: ${WORKFLOWS_READ_PERMISSION:-WORKFLOWS_READ}
+      WORKFLOWS_WRITE_PERMISSION: ${WORKFLOWS_WRITE_PERMISSION:-MANAGE_WORKFLOWS}
+      WORKFLOWS_ADMIN_PERMISSIONS: ${WORKFLOWS_ADMIN_PERMISSIONS:-MANAGE_WORKFLOWS,MANAGE_ACCESS,MANAGE_SETTINGS}
+    networks:
+      - default
+      - shared-internal
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:'+(process.env.WORKFLOWS_MCP_PORT||3030)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  default:
+  shared-internal:
+    name: ${SHARED_NETWORK:-shared-internal-prod}
+    external: true
