@@ -31,6 +31,33 @@ export type WorkflowReadResult =
   | { ok: false; status: 403; reason: "workflow_not_assigned_to_your_roles" }
   | { ok: false; status: number; reason: string };
 
+export interface WorkflowCreateInput {
+  slug: string;
+  title: string;
+  bodyMarkdown: string;
+  description?: string | null;
+  triggers?: string[] | null;
+  connectors?: string[] | null;
+  mustReadBefore?: string[] | null;
+  assignedRoles?: string[] | null;
+  source?: string | null;
+}
+
+export interface WorkflowUpdateInput {
+  title: string;
+  bodyMarkdown: string;
+  description?: string | null;
+  triggers?: string[] | null;
+  connectors?: string[] | null;
+  mustReadBefore?: string[] | null;
+  assignedRoles?: string[] | null;
+  source?: string | null;
+}
+
+export type WorkflowMutationResult<T> =
+  | { ok: true; result: T }
+  | { ok: false; status: number; reason: string };
+
 function summariesFromBody(body: unknown): WorkflowSummary[] {
   if (Array.isArray(body)) return body as WorkflowSummary[];
   if (body && typeof body === "object" && Array.isArray((body as { workflows?: unknown }).workflows)) {
@@ -97,5 +124,82 @@ export class AgentPlatformClient {
 
     const body = await response.json() as WorkflowReadResponse;
     return { ok: true, workflow: body, includes: includesFromBody(body) };
+  }
+
+  async createWorkflow(input: WorkflowCreateInput): Promise<WorkflowMutationResult<{ slug: string }>> {
+    const baseUrl = this.requireBaseUrl();
+    const payload = {
+      slug: input.slug,
+      title: input.title,
+      bodyMarkdown: input.bodyMarkdown,
+      description: input.description ?? undefined,
+      triggers: input.triggers ?? undefined,
+      connectors: input.connectors ?? undefined,
+      mustReadBefore: input.mustReadBefore ?? undefined,
+      assignedRoles: input.assignedRoles ?? undefined,
+      source: input.source ?? "hermes",
+    };
+    const response = await fetch(`${baseUrl}/workflows`, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.bearer()}`,
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (response.status === 201) return { ok: true, result: { slug: input.slug.trim().toLowerCase() } };
+    const text = (await response.text()).slice(0, 400);
+    if (response.status === 400) return { ok: false, status: 400, reason: text || "bad_request" };
+    if (response.status === 403) return { ok: false, status: 403, reason: "missing_manage_workflows_permission" };
+    return { ok: false, status: response.status, reason: text || `agent-platform POST /workflows HTTP ${response.status}` };
+  }
+
+  async updateWorkflow(slug: string, input: WorkflowUpdateInput): Promise<WorkflowMutationResult<true>> {
+    const baseUrl = this.requireBaseUrl();
+    const payload = {
+      title: input.title,
+      bodyMarkdown: input.bodyMarkdown,
+      description: input.description ?? undefined,
+      triggers: input.triggers ?? undefined,
+      connectors: input.connectors ?? undefined,
+      mustReadBefore: input.mustReadBefore ?? undefined,
+      assignedRoles: input.assignedRoles ?? undefined,
+      source: input.source ?? undefined,
+    };
+    const response = await fetch(`${baseUrl}/workflows/${encodeURIComponent(slug)}`, {
+      method: "PUT",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.bearer()}`,
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (response.status === 204) return { ok: true, result: true };
+    const text = (await response.text()).slice(0, 400);
+    if (response.status === 400) return { ok: false, status: 400, reason: text || "bad_request" };
+    if (response.status === 404) return { ok: false, status: 404, reason: "workflow_not_found" };
+    if (response.status === 403) return { ok: false, status: 403, reason: "missing_manage_workflows_permission" };
+    return { ok: false, status: response.status, reason: text || `agent-platform PUT /workflows/${slug} HTTP ${response.status}` };
+  }
+
+  async deleteWorkflow(slug: string): Promise<WorkflowMutationResult<true>> {
+    const baseUrl = this.requireBaseUrl();
+    const response = await fetch(`${baseUrl}/workflows/${encodeURIComponent(slug)}`, {
+      method: "DELETE",
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${this.bearer()}`,
+      },
+    });
+
+    if (response.status === 204) return { ok: true, result: true };
+    const text = (await response.text()).slice(0, 400);
+    if (response.status === 404) return { ok: false, status: 404, reason: "workflow_not_found" };
+    if (response.status === 403) return { ok: false, status: 403, reason: "missing_manage_workflows_permission" };
+    return { ok: false, status: response.status, reason: text || `agent-platform DELETE /workflows/${slug} HTTP ${response.status}` };
   }
 }

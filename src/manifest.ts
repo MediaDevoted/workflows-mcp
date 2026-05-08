@@ -23,6 +23,9 @@ const TOOL_SOURCE: Array<Omit<ToolManifestEntry, "permission_key">> = [
   { name: "workflows_list", mode: "read", requires_approval: false, description: "List workflow playbooks visible to the caller. Optional filters: connector, assignedRole, search." },
   { name: "workflows_search", mode: "read", requires_approval: false, description: "Semantic search over workflow playbooks via OpenAI embeddings + pgvector. Accepts mode='fast'|'deep'." },
   { name: "workflows_read", mode: "read", requires_approval: false, description: "Read a single workflow's bodyMarkdown plus any prerequisite workflows (mustReadBefore)." },
+  { name: "workflows_create", mode: "write", requires_approval: false, description: "Create a new workflow playbook. Requires MANAGE_WORKFLOWS." },
+  { name: "workflows_update", mode: "write", requires_approval: false, description: "Update an existing workflow playbook (slug is immutable). Requires MANAGE_WORKFLOWS." },
+  { name: "workflows_delete", mode: "destructive", requires_approval: true, description: "Delete a workflow playbook. Requires MANAGE_WORKFLOWS and explicit confirm=true." },
 ];
 
 export const TOOLS_MANIFEST: ToolManifestEntry[] = TOOL_SOURCE.map((entry) => ({

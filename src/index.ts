@@ -361,6 +361,121 @@ operational gotchas (DNS cutovers, domain rotation, campaign launches, etc.),
     }),
   );
 
+  server.tool(
+    "workflows_create",
+    "Create a new workflow playbook. Slug is normalized to lower-kebab-case server-side. AssignedRoles gates which roles may read it (empty array = admins only). Requires MANAGE_WORKFLOWS.",
+    {
+      slug: z.string().min(1).describe("Lowercase kebab-case identifier, e.g. 'rotate-domains'."),
+      title: z.string().min(1).describe("Human-readable title shown in lists."),
+      bodyMarkdown: z.string().min(1).describe("Markdown runbook the agent reads when this workflow is invoked."),
+      description: z.string().optional().describe("One-line summary shown alongside the title."),
+      triggers: z.array(z.string()).optional().describe("Short trigger phrases used for prompt search."),
+      connectors: z.array(z.string()).optional().describe("Connector keys this workflow uses (e.g. ['voluum','namecheap'])."),
+      mustReadBefore: z.array(z.string()).optional().describe("Slugs of workflows auto-pulled when this one is read."),
+      assignedRoles: z.array(z.string()).optional().describe("Role keys that may read this workflow. Empty array = visible only to admins."),
+    },
+    async (args) => governed({
+      toolName: "workflows_create",
+      permission: "MANAGE_WORKFLOWS",
+      action: "workflow.create",
+      resourceType: "workflow",
+      resourceId: args.slug,
+      risk: "medium",
+      metadata: { slug: args.slug, title: args.title },
+    }, async () => {
+      const result = await agentPlatform.createWorkflow({
+        slug: args.slug,
+        title: args.title,
+        bodyMarkdown: args.bodyMarkdown,
+        description: args.description ?? null,
+        triggers: args.triggers ?? null,
+        connectors: args.connectors ?? null,
+        mustReadBefore: args.mustReadBefore ?? null,
+        assignedRoles: args.assignedRoles ?? null,
+        source: "hermes",
+      });
+      if (!result.ok) {
+        if (result.status === 403) return { ok: false, denied: true, reason: result.reason };
+        return { ok: false, status: result.status, reason: result.reason };
+      }
+      return { ok: true, slug: result.result.slug };
+    }),
+  );
+
+  server.tool(
+    "workflows_update",
+    "Update an existing workflow playbook. Slug is immutable. List fields (triggers/connectors/mustReadBefore/assignedRoles) are replaced when provided; omit to leave unchanged, pass [] to clear. Requires MANAGE_WORKFLOWS.",
+    {
+      slug: z.string().min(1).describe("Slug of the workflow to update."),
+      title: z.string().min(1),
+      bodyMarkdown: z.string().min(1),
+      description: z.string().optional(),
+      triggers: z.array(z.string()).optional(),
+      connectors: z.array(z.string()).optional(),
+      mustReadBefore: z.array(z.string()).optional(),
+      assignedRoles: z.array(z.string()).optional(),
+    },
+    async (args) => governed({
+      toolName: "workflows_update",
+      permission: "MANAGE_WORKFLOWS",
+      action: "workflow.update",
+      resourceType: "workflow",
+      resourceId: args.slug,
+      risk: "medium",
+      metadata: { slug: args.slug, title: args.title },
+    }, async () => {
+      const result = await agentPlatform.updateWorkflow(args.slug, {
+        title: args.title,
+        bodyMarkdown: args.bodyMarkdown,
+        description: args.description ?? null,
+        triggers: args.triggers ?? null,
+        connectors: args.connectors ?? null,
+        mustReadBefore: args.mustReadBefore ?? null,
+        assignedRoles: args.assignedRoles ?? null,
+        source: "hermes",
+      });
+      if (!result.ok) {
+        if (result.status === 404) return { ok: false, reason: "workflow_not_found" };
+        if (result.status === 403) return { ok: false, denied: true, reason: result.reason };
+        return { ok: false, status: result.status, reason: result.reason };
+      }
+      return { ok: true, slug: args.slug.trim().toLowerCase() };
+    }),
+  );
+
+  server.tool(
+    "workflows_delete",
+    "Delete a workflow playbook. DESTRUCTIVE — confirm must be true. References from other workflows' mustReadBefore are silently skipped after delete. Requires MANAGE_WORKFLOWS.",
+    {
+      slug: z.string().min(1).describe("Slug of the workflow to delete."),
+      confirm: z.boolean().describe("Must be true; rejects otherwise. Forces an explicit second-step confirmation."),
+    },
+    async ({ slug, confirm }) => governed({
+      toolName: "workflows_delete",
+      permission: "MANAGE_WORKFLOWS",
+      action: "workflow.delete",
+      resourceType: "workflow",
+      resourceId: slug,
+      risk: "high",
+      metadata: { slug, confirm },
+    }, async () => {
+      if (!confirm) {
+        return {
+          ok: false,
+          reason: "confirmation_required",
+          message: "Pass confirm=true to proceed. This deletes the workflow permanently.",
+        };
+      }
+      const result = await agentPlatform.deleteWorkflow(slug);
+      if (!result.ok) {
+        if (result.status === 404) return { ok: false, reason: "workflow_not_found" };
+        if (result.status === 403) return { ok: false, denied: true, reason: result.reason };
+        return { ok: false, status: result.status, reason: result.reason };
+      }
+      return { ok: true, deleted: slug.trim().toLowerCase() };
+    }),
+  );
+
   return server;
 }
 
