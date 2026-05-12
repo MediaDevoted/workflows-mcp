@@ -1,0 +1,30 @@
+name: overview-check
+
+# Verifies that ${connector}://overview mentions every registered tool.
+# When the overview omits a tool, capable LLMs build incomplete mental
+# maps and refuse to use the tool on follow-up turns. See voluum-mcp PR
+# #1 and textyou-mcp PR #1 for the original incidents.
+
+on:
+  pull_request:
+    paths:
+      - 'src/index.ts'
+      - 'ci/check-overview-tools.sh'
+      - '.github/workflows/overview-check.yml'
+  push:
+    branches: [dev, main]
+    paths:
+      - 'src/index.ts'
+      - 'ci/check-overview-tools.sh'
+      - '.github/workflows/overview-check.yml'
+
+jobs:
+  check:
+    name: Overview ↔ Tools consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify overview mentions every registered tool
+        run: |
+          chmod +x ci/check-overview-tools.sh
+          ./ci/check-overview-tools.sh
