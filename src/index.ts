@@ -9,7 +9,7 @@ import { z } from "zod";
 import { AgentPlatformClient, type WorkflowDto, type WorkflowSummary } from "./agent-platform.js";
 import { syncCatalogOnBoot } from "./catalog-sync.js";
 import { loadConfig } from "./config.js";
-import { EmployeeApiClient } from "./employee-api.js";
+import { EmployeeApiClient } from "@mediadevoted/mcp-passthrough/employee-api";
 import { jsonText } from "./format.js";
 import { manifestPayload, toolPermissionKey, TOOLS_MANIFEST } from "./manifest.js";
 import { employeeApiKeyFromHeaders, runWithRequestContext } from "@mediadevoted/mcp-passthrough/request-context";
@@ -26,7 +26,10 @@ import {
 } from "./search/index.js";
 
 const config = loadConfig();
-const employeeApi = new EmployeeApiClient(config.employeeApi);
+// requireAllPermissions: workflows-mcp historically used filtered.every() —
+// when authorize() gets an array of permissions the caller must hold ALL of
+// them. The package defaults to `some` for connector MCPs.
+const employeeApi = new EmployeeApiClient({ ...config.employeeApi, requireAllPermissions: true }, "workflows");
 const agentPlatform = new AgentPlatformClient(config.agentPlatform);
 const toolVisibility = new ToolVisibilityClient({
   baseUrl: config.agentPlatform.baseUrl,
