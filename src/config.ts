@@ -73,7 +73,7 @@ export function loadConfig(): ServerConfig {
       cacheSeconds: Number.parseInt(env("EMPLOYEE_AUTH_CACHE_SECONDS", "30"), 10),
       readPermission: env("WORKFLOWS_READ_PERMISSION", "WORKFLOWS_READ"),
       writePermission: env("WORKFLOWS_WRITE_PERMISSION", "MANAGE_WORKFLOWS"),
-      adminPermissions: splitCsv(env("WORKFLOWS_ADMIN_PERMISSIONS", "MANAGE_WORKFLOWS,MANAGE_ACCESS,MANAGE_SETTINGS")),
+      adminPermissions: splitCsv(env("WORKFLOWS_ADMIN_PERMISSIONS", "MANAGE_WORKFLOWS")),
     },
     agentPlatform: {
       baseUrl: agentPlatformUrl,
