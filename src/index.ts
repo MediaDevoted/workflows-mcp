@@ -13,6 +13,7 @@ import { EmployeeApiClient } from "./employee-api.js";
 import { jsonText } from "./format.js";
 import { manifestPayload, toolPermissionKey, TOOLS_MANIFEST } from "./manifest.js";
 import { employeeApiKeyFromHeaders, runWithRequestContext } from "./request-context.js";
+import { applyHiddenFilter, ToolVisibilityClient } from "./tool-visibility.js";
 import {
   EmbeddingsClient,
   EmbeddingsStore,
@@ -27,6 +28,12 @@ import {
 const config = loadConfig();
 const employeeApi = new EmployeeApiClient(config.employeeApi);
 const agentPlatform = new AgentPlatformClient(config.agentPlatform);
+const toolVisibility = new ToolVisibilityClient({
+  baseUrl: config.agentPlatform.baseUrl,
+  apiKey: config.agentPlatform.apiKey,
+  connector: "workflows",
+  log: (message) => process.stderr.write(`[workflows-mcp][tool-visibility] ${message}\n`),
+});
 
 let embeddingsClient: EmbeddingsClient | null = null;
 let embeddingsStore: EmbeddingsStore | null = null;
@@ -476,6 +483,19 @@ operational gotchas (DNS cutovers, domain rotation, campaign launches, etc.),
     }),
   );
 
+  // Apply the current tool-visibility hidden set and re-apply whenever it
+  // refreshes. Disabled tools disappear from tools/list and reject tools/call
+  // at the SDK level, so the LLM never sees the hidden surface.
+  applyHiddenFilter(server, toolVisibility);
+  const unsubscribe = toolVisibility.onChange(() => applyHiddenFilter(server, toolVisibility));
+  // Drop the subscription when the underlying transport closes so we don't
+  // leak listeners across reconnected HTTP sessions.
+  const originalClose = server.close.bind(server);
+  server.close = async () => {
+    unsubscribe();
+    await originalClose();
+  };
+
   return server;
 }
 
@@ -490,6 +510,13 @@ async function main(): Promise<void> {
     agentPlatform: config.agentPlatform,
     log,
   });
+
+  // Prime the hidden-tools cache before any tools/list call goes out, then
+  // start the background refresh. Empty set on first boot is the default —
+  // existing behavior is preserved when agent-platform has no entries.
+  await toolVisibility.refresh();
+  toolVisibility.startBackgroundRefresh();
+  log(`tool-visibility: ${toolVisibility.getHiddenCount()} tool(s) hidden`);
 
   if (!config.search.openaiApiKey) {
     log("semantic search disabled: OPENAI_API_KEY is not set (workflows_search will degrade to trigger ranking)");
