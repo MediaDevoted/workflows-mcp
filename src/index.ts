@@ -14,6 +14,7 @@ import { jsonText } from "./format.js";
 import { manifestPayload, toolPermissionKey, TOOLS_MANIFEST } from "./manifest.js";
 import { employeeApiKeyFromHeaders, runWithRequestContext } from "@mediadevoted/mcp-passthrough/request-context";
 import { applyHiddenFilter, ToolVisibilityClient } from "@mediadevoted/mcp-passthrough/tool-visibility";
+import { applyPermissionFilterForRequest } from "@mediadevoted/mcp-passthrough/tools-list-filter";
 import {
   EmbeddingsClient,
   EmbeddingsStore,
@@ -624,7 +625,16 @@ async function main(): Promise<void> {
             const sid = transport.sessionId;
             if (sid) sessions.delete(sid);
           };
-          await createMcpServerInstance().connect(transport);
+          const sessionServer = createMcpServerInstance();
+          await sessionServer.connect(transport);
+          // Filter tools/list to what this caller can actually call. Per-session
+          // because each session gets its own McpServer + its own caller. Fails
+          // open on introspect error / auth-disabled / missing-key.
+          await applyPermissionFilterForRequest(sessionServer, req.headers, {
+            employeeApi,
+            adminPermissions: config.employeeApi.adminPermissions,
+            log: (m) => log(`tools-list-filter: ${m}`),
+          });
         } else {
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Bad request — no valid session" }));
