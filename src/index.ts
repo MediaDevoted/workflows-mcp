@@ -12,8 +12,8 @@ import { loadConfig } from "./config.js";
 import { EmployeeApiClient } from "./employee-api.js";
 import { jsonText } from "./format.js";
 import { manifestPayload, toolPermissionKey, TOOLS_MANIFEST } from "./manifest.js";
-import { employeeApiKeyFromHeaders, runWithRequestContext } from "./request-context.js";
-import { applyHiddenFilter, ToolVisibilityClient } from "./tool-visibility.js";
+import { employeeApiKeyFromHeaders, runWithRequestContext } from "@mediadevoted/mcp-passthrough/request-context";
+import { applyHiddenFilter, ToolVisibilityClient } from "@mediadevoted/mcp-passthrough/tool-visibility";
 import {
   EmbeddingsClient,
   EmbeddingsStore,

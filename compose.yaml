@@ -2,7 +2,13 @@
 # `docker compose` does not fail when `.env` is absent on the server.
 services:
   workflows-mcp:
-    build: .
+    build:
+      context: .
+      args:
+        # NPM_TOKEN is required at build time so `npm install` can pull
+        # @mediadevoted/mcp-passthrough from GitHub Packages. Set it in
+        # the stack's .env (Komodo periphery sources that file).
+        NPM_TOKEN: ${NPM_TOKEN}
     container_name: workflows-mcp
     restart: unless-stopped
     depends_on:

@@ -1,5 +1,5 @@
 import type { AgentPlatformClientConfig } from "./config.js";
-import { currentEmployeeApiKey } from "./request-context.js";
+import { currentEmployeeApiKey } from "@mediadevoted/mcp-passthrough/request-context";
 
 export interface WorkflowSummary {
   slug: string;
