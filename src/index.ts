@@ -14,7 +14,7 @@ import { jsonText } from "./format.js";
 import { manifestPayload, toolPermissionKey, TOOLS_MANIFEST } from "./manifest.js";
 import { employeeApiKeyFromHeaders, runWithRequestContext } from "@mediadevoted/mcp-passthrough/request-context";
 import { applyHiddenFilter, ToolVisibilityClient } from "@mediadevoted/mcp-passthrough/tool-visibility";
-import { applyPermissionFilterForRequest } from "@mediadevoted/mcp-passthrough/tools-list-filter";
+import { applyPermissionFilterForRequest, tagToolWithPermissionKey } from "@mediadevoted/mcp-passthrough/tools-list-filter";
 import {
   EmbeddingsClient,
   EmbeddingsStore,
@@ -263,6 +263,7 @@ operational gotchas (DNS cutovers, domain rotation, campaign launches, etc.),
       };
     }),
   );
+  tagToolWithPermissionKey(server, "workflows_list", toolPermissionKey("workflows_list"));
 
   server.tool(
     "workflows_search",
@@ -338,6 +339,7 @@ operational gotchas (DNS cutovers, domain rotation, campaign launches, etc.),
       };
     }),
   );
+  tagToolWithPermissionKey(server, "workflows_search", toolPermissionKey("workflows_search"));
 
   server.tool(
     "workflows_read",
@@ -371,6 +373,7 @@ operational gotchas (DNS cutovers, domain rotation, campaign launches, etc.),
       };
     }),
   );
+  tagToolWithPermissionKey(server, "workflows_read", toolPermissionKey("workflows_read"));
 
   server.tool(
     "workflows_create",
@@ -412,6 +415,7 @@ operational gotchas (DNS cutovers, domain rotation, campaign launches, etc.),
       return { ok: true, slug: result.result.slug };
     }),
   );
+  tagToolWithPermissionKey(server, "workflows_create", toolPermissionKey("workflows_create"));
 
   server.tool(
     "workflows_update",
@@ -453,6 +457,7 @@ operational gotchas (DNS cutovers, domain rotation, campaign launches, etc.),
       return { ok: true, slug: args.slug.trim().toLowerCase() };
     }),
   );
+  tagToolWithPermissionKey(server, "workflows_update", toolPermissionKey("workflows_update"));
 
   server.tool(
     "workflows_delete",
@@ -486,6 +491,7 @@ operational gotchas (DNS cutovers, domain rotation, campaign launches, etc.),
       return { ok: true, deleted: slug.trim().toLowerCase() };
     }),
   );
+  tagToolWithPermissionKey(server, "workflows_delete", toolPermissionKey("workflows_delete"));
 
   // Apply the current tool-visibility hidden set and re-apply whenever it
   // refreshes. Disabled tools disappear from tools/list and reject tools/call
