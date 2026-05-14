@@ -7,7 +7,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { AgentPlatformClient, type WorkflowDto, type WorkflowSummary } from "./agent-platform.js";
-import { syncCatalogOnBoot } from "./catalog-sync.js";
+import { syncCatalogOnBoot } from "@mediadevoted/mcp-passthrough/catalog-sync";
 import { loadConfig } from "./config.js";
 import { EmployeeApiClient } from "@mediadevoted/mcp-passthrough/employee-api";
 import { jsonText } from "./format.js";
