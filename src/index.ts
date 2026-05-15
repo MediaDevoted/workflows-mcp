@@ -15,6 +15,12 @@ import { manifestPayload, toolPermissionKey, TOOLS_MANIFEST } from "./manifest.j
 import { employeeApiKeyFromHeaders, runWithRequestContext } from "@mediadevoted/mcp-passthrough/request-context";
 import { applyHiddenFilter, ToolVisibilityClient } from "@mediadevoted/mcp-passthrough/tool-visibility";
 import { applyPermissionFilterForRequest, tagToolWithPermissionKey } from "@mediadevoted/mcp-passthrough/tools-list-filter";
+import { DynamicToolsetController, tagToolWithToolset } from "@mediadevoted/mcp-passthrough/dynamic-toolsets";
+import {
+  DynamicToolsetV2Controller,
+  META_TOOL_SCHEMAS_V2,
+  META_TOOL_ZOD_SHAPES_V2,
+} from "@mediadevoted/mcp-passthrough/dynamic-toolsets-v2";
 import {
   EmbeddingsClient,
   EmbeddingsStore,
@@ -37,6 +43,38 @@ const toolVisibility = new ToolVisibilityClient({
   apiKey: config.agentPlatform.apiKey,
   connector: "workflows",
   log: (message) => process.stderr.write(`[workflows-mcp][tool-visibility] ${message}\n`),
+});
+
+// GitHub-style progressive disclosure (off by default — flip
+// MCP_DYNAMIC_TOOLSETS=1 for v1 or MCP_DYNAMIC_TOOLSETS=v2 for the search-
+// based v2 controller). All six workflow tools live in a single auto-derived
+// "workflows" bucket; the v2 meta-tools (search_tools/describe_tools/
+// execute_tool) live in the always-on "_default" bucket.
+//
+// Both controllers are singletons (per-MCP-process) because their per-session
+// state is keyed by SDK session id. Each HTTP request still gets its own
+// `McpServer` via `createMcpServerInstance`, and `applyToSession` is called
+// against that instance with its session id.
+const dynamicToolsets = new DynamicToolsetController({
+  descriptions: {
+    _default: "Meta-tools — always available.",
+    workflows: "MediaDevoted workflow playbooks — list, search, read, create, update, delete.",
+  },
+  log: (m) => process.stderr.write(`[workflows-mcp][dynamic-toolsets] ${m}\n`),
+});
+
+// v2 dynamic toolsets — search-based progressive disclosure. Active when
+// MCP_DYNAMIC_TOOLSETS=v2 is set. v1 controller above is preserved for the
+// legacy MCP_DYNAMIC_TOOLSETS=1 path; v2's three meta-tools replace v1's so
+// the LLM always sees the search-first menu. When the env flag is off, both
+// controllers' applyToSession is a no-op and all tools stay visible.
+//
+// No category overrides — with only six tools in a single "workflows" bucket
+// the auto-derived menu copy is fine. setCategoryMeta() can be added later
+// if the menu phrasing drifts off-intent.
+const dynamicToolsetsV2 = new DynamicToolsetV2Controller({
+  serverLabel: "workflows MCP",
+  log: (m) => process.stderr.write(`[workflows-mcp][dynamic-toolsets-v2] ${m}\n`),
 });
 
 let embeddingsClient: EmbeddingsClient | null = null;
@@ -264,6 +302,7 @@ operational gotchas (DNS cutovers, domain rotation, campaign launches, etc.),
     }),
   );
   tagToolWithPermissionKey(server, "workflows_list", toolPermissionKey("workflows_list"));
+  tagToolWithToolset(server, "workflows_list", "workflows");
 
   server.tool(
     "workflows_search",
@@ -340,6 +379,7 @@ operational gotchas (DNS cutovers, domain rotation, campaign launches, etc.),
     }),
   );
   tagToolWithPermissionKey(server, "workflows_search", toolPermissionKey("workflows_search"));
+  tagToolWithToolset(server, "workflows_search", "workflows");
 
   server.tool(
     "workflows_read",
@@ -374,6 +414,7 @@ operational gotchas (DNS cutovers, domain rotation, campaign launches, etc.),
     }),
   );
   tagToolWithPermissionKey(server, "workflows_read", toolPermissionKey("workflows_read"));
+  tagToolWithToolset(server, "workflows_read", "workflows");
 
   server.tool(
     "workflows_create",
@@ -416,6 +457,7 @@ operational gotchas (DNS cutovers, domain rotation, campaign launches, etc.),
     }),
   );
   tagToolWithPermissionKey(server, "workflows_create", toolPermissionKey("workflows_create"));
+  tagToolWithToolset(server, "workflows_create", "workflows");
 
   server.tool(
     "workflows_update",
@@ -458,6 +500,7 @@ operational gotchas (DNS cutovers, domain rotation, campaign launches, etc.),
     }),
   );
   tagToolWithPermissionKey(server, "workflows_update", toolPermissionKey("workflows_update"));
+  tagToolWithToolset(server, "workflows_update", "workflows");
 
   server.tool(
     "workflows_delete",
@@ -492,6 +535,95 @@ operational gotchas (DNS cutovers, domain rotation, campaign launches, etc.),
     }),
   );
   tagToolWithPermissionKey(server, "workflows_delete", toolPermissionKey("workflows_delete"));
+  tagToolWithToolset(server, "workflows_delete", "workflows");
+
+  // ---------------------------------------------------------------------------
+  // Dynamic-toolsets v2 meta-tools — search_tools / describe_tools / execute_tool.
+  // No v1 equivalents were registered for workflows-mcp; v2 is the only shape.
+  // Always registered; effectively no-ops on visibility until
+  // MCP_DYNAMIC_TOOLSETS=v2 flips on (controller.applyToSession is a no-op
+  // when the flag is unset, and search/describe still work cheaply even if
+  // no tools are gated — useful for ad-hoc catalog browsing).
+  // ---------------------------------------------------------------------------
+  const metaToolSessionId = (extra: { sessionId?: string }): string => extra.sessionId ?? "default";
+
+  // We can't render the categorical overview for search_tools.description
+  // until after all tools (passthrough + meta) have been registered and
+  // tagged. Register the meta-tools with placeholder descriptions first, then
+  // call controller.renderSearchToolDescription(server) below to overwrite
+  // search_tools' description with the auto-generated menu.
+  const searchToolReg = server.tool(
+    META_TOOL_SCHEMAS_V2.search_tools.name,
+    META_TOOL_SCHEMAS_V2.search_tools.description,
+    META_TOOL_ZOD_SHAPES_V2.search_tools,
+    async (args) => {
+      const query = (args.query ?? "").trim();
+      if (!query) return json({ ok: false, error: "query_required" });
+      const limit = args.limit ?? 10;
+      try {
+        const hits = dynamicToolsetsV2.search(server, query, limit);
+        return json({ ok: true, query, count: hits.length, results: hits });
+      } catch (error) {
+        return json({ ok: false, error: error instanceof Error ? error.message : String(error) });
+      }
+    },
+  );
+  dynamicToolsets.setToolsetOverride(META_TOOL_SCHEMAS_V2.search_tools.name, "_default");
+  dynamicToolsetsV2.setToolsetOverride(META_TOOL_SCHEMAS_V2.search_tools.name, "_default");
+
+  server.tool(
+    META_TOOL_SCHEMAS_V2.describe_tools.name,
+    META_TOOL_SCHEMAS_V2.describe_tools.description,
+    META_TOOL_ZOD_SHAPES_V2.describe_tools,
+    async (args, extra) => {
+      const names = Array.isArray(args.names) ? args.names.map((n) => String(n).trim()).filter(Boolean) : [];
+      if (names.length === 0) return json({ ok: false, error: "names_required" });
+      if (names.length > 10) return json({ ok: false, error: "max_10_names_per_call" });
+      try {
+        const described = dynamicToolsetsV2.describe(server, metaToolSessionId(extra), names);
+        return json({ ok: true, tools: described });
+      } catch (error) {
+        return json({ ok: false, error: error instanceof Error ? error.message : String(error) });
+      }
+    },
+  );
+  dynamicToolsets.setToolsetOverride(META_TOOL_SCHEMAS_V2.describe_tools.name, "_default");
+  dynamicToolsetsV2.setToolsetOverride(META_TOOL_SCHEMAS_V2.describe_tools.name, "_default");
+
+  server.tool(
+    META_TOOL_SCHEMAS_V2.execute_tool.name,
+    META_TOOL_SCHEMAS_V2.execute_tool.description,
+    META_TOOL_ZOD_SHAPES_V2.execute_tool,
+    async (args, extra) => {
+      const name = String(args.name ?? "").trim();
+      if (!name) return json({ ok: false, error: "name_required" });
+      const routed = dynamicToolsetsV2.routeExecute(server, metaToolSessionId(extra), name);
+      if (!routed) return json({ ok: false, error: `unknown_tool:${name}` });
+      try {
+        // routed.tool.handler is the registered SDK callback. Invoke it with
+        // the supplied args object. We bypass tools/call so the SDK doesn't
+        // re-route through this meta-tool.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const result = await (routed.tool as any).handler(args.args ?? {}, extra);
+        return result;
+      } catch (error) {
+        return json({ ok: false, error: error instanceof Error ? error.message : String(error) });
+      }
+    },
+  );
+  dynamicToolsets.setToolsetOverride(META_TOOL_SCHEMAS_V2.execute_tool.name, "_default");
+  dynamicToolsetsV2.setToolsetOverride(META_TOOL_SCHEMAS_V2.execute_tool.name, "_default");
+
+  // Render the categorical overview AFTER all tools (passthrough + meta) are
+  // registered and tagged. This builds the "menu" the LLM sees in tools/list
+  // and is the single most important behavioural lever in v2 — without it
+  // the model never reaches for search_tools.
+  try {
+    const overview = dynamicToolsetsV2.renderSearchToolDescription(server);
+    searchToolReg.update({ description: overview });
+  } catch (error) {
+    log(`dynamic-toolsets-v2: failed to render search_tools description: ${error instanceof Error ? error.message : String(error)}`);
+  }
 
   // Apply the current tool-visibility hidden set and re-apply whenever it
   // refreshes. Disabled tools disappear from tools/list and reject tools/call
@@ -629,7 +761,13 @@ async function main(): Promise<void> {
           });
           transport.onclose = () => {
             const sid = transport.sessionId;
-            if (sid) sessions.delete(sid);
+            if (sid) {
+              sessions.delete(sid);
+              // Free per-session dynamic-toolset state so the controllers don't
+              // grow unbounded across long-lived MCP processes.
+              dynamicToolsets.releaseSession(sid);
+              dynamicToolsetsV2.releaseSession(sid);
+            }
           };
           const sessionServer = createMcpServerInstance();
           await sessionServer.connect(transport);
@@ -641,6 +779,16 @@ async function main(): Promise<void> {
             adminPermissions: config.employeeApi.adminPermissions,
             log: (m) => log(`tools-list-filter: ${m}`),
           });
+          // Layer the dynamic-toolsets filter on top of permission filtering.
+          // Order matters: permission filter runs first (it hides what the
+          // caller can't call at all), then dynamic-toolsets hides the
+          // long-tail buckets until the LLM reveals them via search/describe
+          // (v2) or enable_toolset (v1). Both layers only ever flip ON → OFF,
+          // so they compose without fighting each other. v1 is a no-op unless
+          // MCP_DYNAMIC_TOOLSETS=1; v2 is a no-op unless MCP_DYNAMIC_TOOLSETS=v2.
+          const sid = transport.sessionId ?? "default";
+          dynamicToolsets.applyToSession(sessionServer, sid);
+          dynamicToolsetsV2.applyToSession(sessionServer, sid);
         } else {
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Bad request — no valid session" }));
@@ -659,6 +807,13 @@ async function main(): Promise<void> {
   } else {
     const server = createMcpServerInstance();
     await server.connect(new StdioServerTransport());
+    // Apply the dynamic-toolsets filter once for the single stdio session.
+    // Permission filtering is HTTP-only (it reads the Employee API key from
+    // request headers), so the stdio path goes straight to the toolset filter.
+    // v1: no-op unless MCP_DYNAMIC_TOOLSETS=1. v2: no-op unless
+    // MCP_DYNAMIC_TOOLSETS=v2.
+    dynamicToolsets.applyToSession(server, "default");
+    dynamicToolsetsV2.applyToSession(server, "default");
     log("running on stdio");
   }
 }
