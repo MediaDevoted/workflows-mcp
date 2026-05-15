@@ -39,6 +39,7 @@ services:
       EMBEDDINGS_DB_URL: ${EMBEDDINGS_DB_URL:-postgres://workflows:${EMBEDDINGS_DB_PASSWORD:-placeholder}@workflows-mcp-pgvector:5432/embeddings}
       EMBEDDINGS_SYNC_INTERVAL_MS: ${EMBEDDINGS_SYNC_INTERVAL_MS:-300000}
       EMBEDDINGS_BATCH_SIZE: ${EMBEDDINGS_BATCH_SIZE:-50}
+      MCP_DYNAMIC_TOOLSETS: ${MCP_DYNAMIC_TOOLSETS:-}
     networks:
       - default
       - shared-internal
