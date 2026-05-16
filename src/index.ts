@@ -6,12 +6,13 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
-import { AgentPlatformClient, type WorkflowDto, type WorkflowSummary } from "./agent-platform.js";
+import { AgentPlatformClient, type WorkflowDto } from "./agent-platform.js";
 import { syncCatalogOnBoot } from "@mediadevoted/mcp-passthrough/catalog-sync";
 import { loadConfig } from "./config.js";
 import { EmployeeApiClient } from "@mediadevoted/mcp-passthrough/employee-api";
 import { jsonText } from "./format.js";
 import { manifestPayload, toolPermissionKey, TOOLS_MANIFEST } from "./manifest.js";
+import { scoreWorkflow } from "./ranking.js";
 import { employeeApiKeyFromHeaders, runWithRequestContext } from "@mediadevoted/mcp-passthrough/request-context";
 import { applyHiddenFilter, ToolVisibilityClient } from "@mediadevoted/mcp-passthrough/tool-visibility";
 import { applyPermissionFilterForRequest, tagToolWithPermissionKey } from "@mediadevoted/mcp-passthrough/tools-list-filter";
@@ -147,40 +148,6 @@ async function governed<T>(
   }
 }
 
-interface ScoredWorkflow {
-  slug: string;
-  title: string;
-  description: string;
-  score: number;
-  matched_triggers: string[];
-}
-
-function scoreWorkflow(workflow: WorkflowSummary, query: string): ScoredWorkflow {
-  const needle = query.trim().toLowerCase();
-  const tokens = needle.split(/\s+/).filter(Boolean);
-  const title = (workflow.title ?? "").toLowerCase();
-  const description = (workflow.description ?? "").toLowerCase();
-  const triggers = (workflow.triggers ?? []).map((t) => t.toLowerCase());
-
-  const matchedTriggers = triggers.filter((t) => t.includes(needle) || tokens.some((tok) => t.includes(tok)));
-
-  let score = 0;
-  for (const tok of tokens) {
-    if (title.includes(tok)) score += 3;
-    if (triggers.some((t) => t.includes(tok))) score += 2;
-    if (description.includes(tok)) score += 1;
-  }
-  if (needle && title.includes(needle)) score += 3;
-
-  return {
-    slug: workflow.slug,
-    title: workflow.title,
-    description: workflow.description,
-    score,
-    matched_triggers: workflow.triggers?.filter((t) => matchedTriggers.includes(t.toLowerCase())) ?? [],
-  };
-}
-
 function summarize(workflow: WorkflowDto) {
   return {
     slug: workflow.slug,
@@ -196,7 +163,7 @@ function summarize(workflow: WorkflowDto) {
 function createMcpServerInstance(): McpServer {
   const server = new McpServer({
     name: "workflows-mcp",
-    version: "0.1.0",
+    version: "0.1.1",
   }, {
     capabilities: {
       tools: {},
@@ -319,14 +286,30 @@ operational gotchas (DNS cutovers, domain rotation, campaign launches, etc.),
       resourceType: "workflow",
       metadata: { query, limit, mode },
     }, async () => {
+      // Defensive: mcp-passthrough's execute_tool meta-tool forwards args
+      // directly to the handler, bypassing the Zod schema above. Coerce here
+      // so a missing/non-string query returns a graceful error instead of
+      // crashing in scoreWorkflow or the embeddings client.
+      const safeQuery = typeof query === "string" ? query.trim() : "";
+      const safeLimit = typeof limit === "number" && Number.isFinite(limit) ? limit : 5;
+      const safeMode: SearchMode = mode === "deep" ? "deep" : "fast";
+      if (!safeQuery) {
+        return {
+          ok: false,
+          error: "query_required",
+          query: safeQuery,
+          mode: safeMode,
+        };
+      }
+
       const visibleWorkflows = await agentPlatform.listWorkflows();
       const visibleSlugs = visibleWorkflows.map((w) => w.slug);
 
       if (visibleSlugs.length === 0) {
         return {
           ok: true,
-          query,
-          mode,
+          query: safeQuery,
+          mode: safeMode,
           total_visible: 0,
           returned: 0,
           results: [],
@@ -336,17 +319,17 @@ operational gotchas (DNS cutovers, domain rotation, campaign launches, etc.),
 
       if (embeddingsClient && embeddingsStore) {
         try {
-          const vector = await embeddingsClient.embed(query);
+          const vector = await embeddingsClient.embed(safeQuery);
           const hits: SearchHit[] = await embeddingsStore.query({
             embedding: vector,
             visibleSlugs,
-            limit,
-            mode: mode as SearchMode,
+            limit: safeLimit,
+            mode: safeMode,
           });
           return {
             ok: true,
-            query,
-            mode,
+            query: safeQuery,
+            mode: safeMode,
             total_visible: visibleSlugs.length,
             returned: hits.length,
             results: hits,
@@ -363,15 +346,15 @@ operational gotchas (DNS cutovers, domain rotation, campaign launches, etc.),
       }
 
       const ranked = visibleWorkflows
-        .map((workflow) => scoreWorkflow(workflow, query))
+        .map((workflow) => scoreWorkflow(workflow, safeQuery))
         .filter((entry) => entry.score > 0)
         .sort((a, b) => b.score - a.score)
-        .slice(0, limit);
+        .slice(0, safeLimit);
       return {
         ok: true,
         degraded: true,
-        query,
-        mode,
+        query: safeQuery,
+        mode: safeMode,
         total_visible: visibleSlugs.length,
         returned: ranked.length,
         results: ranked,
