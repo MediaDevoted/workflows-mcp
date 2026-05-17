@@ -1,211 +1,153 @@
 #!/usr/bin/env node
+/**
+ * Workflows MCP server — v0.2.
+ *
+ * Migrated from the bespoke 1.x bootstrap to the shared v2 runtime in
+ * `@mediadevoted/mcp-passthrough`. Transport/session/auth/dynamic-toolsets
+ * wiring lives in `runMcpServer`; this file only owns the connector-specific
+ * pieces: identity client, audit-trail client, workflow tool registration,
+ * resources, and the optional pgvector-backed semantic search.
+ *
+ * workflows-mcp is the canonical store for team/account conventions and
+ * playbooks consumed at runtime by other MCPs. The tool API
+ * (`workflows_list`, `workflows_search`, `workflows_read`,
+ * `workflows_create`, `workflows_update`, `workflows_delete`) is
+ * backward-compatible with v0.1.x — only the bootstrap layer changed.
+ */
 
-import { randomUUID } from "node:crypto";
-import { createServer } from "node:http";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { z } from "zod";
-import { AgentPlatformClient, type WorkflowDto } from "./agent-platform.js";
-import { syncCatalogOnBoot } from "@mediadevoted/mcp-passthrough/catalog-sync";
-import { loadConfig } from "./config.js";
-import { EmployeeApiClient } from "@mediadevoted/mcp-passthrough/employee-api";
-import { jsonText } from "./format.js";
-import { manifestPayload, toolPermissionKey, TOOLS_MANIFEST } from "./manifest.js";
-import { scoreWorkflow } from "./ranking.js";
-import { employeeApiKeyFromHeaders, runWithRequestContext } from "@mediadevoted/mcp-passthrough/request-context";
-import { applyHiddenFilter, ToolVisibilityClient } from "@mediadevoted/mcp-passthrough/tool-visibility";
-import { applyPermissionFilterForRequest, tagToolWithPermissionKey } from "@mediadevoted/mcp-passthrough/tools-list-filter";
-import { DynamicToolsetController, tagToolWithToolset } from "@mediadevoted/mcp-passthrough/dynamic-toolsets";
 import {
+  buildAccountHints,
+  CostTracker,
   DynamicToolsetV2Controller,
-  META_TOOL_SCHEMAS_V2,
-  META_TOOL_ZOD_SHAPES_V2,
-} from "@mediadevoted/mcp-passthrough/dynamic-toolsets-v2";
+  EmployeeIdentityClient,
+  err,
+  errors,
+  ok,
+  registerCommonResources,
+  runMcpServer,
+  syncCatalogOnBoot,
+  ToolVisibilityClient,
+  toolResultToContent,
+  type ToolResult,
+} from "@mediadevoted/mcp-passthrough";
+import { checkApprovalGate } from "@mediadevoted/mcp-passthrough/approval-gate";
+import { AuditTrailClient } from "@mediadevoted/mcp-passthrough/audit-trail";
+import { tagToolWithPermissionKey } from "@mediadevoted/mcp-passthrough/tools-list-filter";
+import { z } from "zod";
+import { AgentPlatformClient, type WorkflowDto, type WorkflowSummary } from "./agent-platform.js";
+import { loadConfig } from "./config.js";
+import {
+  annotationsForTool,
+  buildWorkflowsManifest,
+  CONNECTOR,
+  descriptionForTool,
+  TOOL_NAMES,
+  toolPermissionKey,
+} from "./manifest.js";
+import { scoreWorkflow } from "./ranking.js";
 import {
   EmbeddingsClient,
   EmbeddingsStore,
   EmbeddingsUnavailableError,
+  embeddingDimensions,
   StoreUnavailableError,
   SyncRunner,
-  embeddingDimensions,
   type SearchHit,
   type SearchMode,
 } from "./search/index.js";
 
+const SERVER_NAME = "workflows-mcp";
+const SERVER_VERSION = "0.2.0";
+
 const config = loadConfig();
-// requireAllPermissions: workflows-mcp historically used filtered.every() —
-// when authorize() gets an array of permissions the caller must hold ALL of
-// them. The package defaults to `some` for connector MCPs.
-const employeeApi = new EmployeeApiClient({ ...config.employeeApi, requireAllPermissions: true }, "workflows");
-const agentPlatform = new AgentPlatformClient(config.agentPlatform);
+const log = (m: string) => process.stderr.write(`[${SERVER_NAME}] ${m}\n`);
+
+// workflows-mcp historically requires ALL of [coarse, per-tool] permissions on
+// authorize(...) — keeps the legacy behavior where MANAGE_WORKFLOWS and the
+// per-tool key must BOTH be present for writes. Voluum/Cloudflare default to
+// ANY; this stays explicit.
+const identity = new EmployeeIdentityClient({
+  baseUrl: config.employeeApiUrl,
+  connector: CONNECTOR,
+  serviceKey: config.employeeApiServiceKey,
+  authDisabled: config.employeeAuthDisabled,
+  cacheSeconds: config.employeeAuthCacheSeconds,
+  readPermission: config.readPermission,
+  writePermission: config.writePermission,
+  adminPermissions: config.adminPermissions,
+  crossTeamReadPermissions: config.crossTeamReadPermissions,
+  requireAll: true,
+  log,
+});
+
+const agentPlatform = new AgentPlatformClient({
+  baseUrl: config.agentPlatformUrl,
+  apiKey: config.agentPlatformApiKey,
+  enabled: config.agentPlatformEnabled,
+  allowedTeams: config.allowedTeams,
+});
+
+const auditTrail = new AuditTrailClient({
+  connector: CONNECTOR,
+  baseUrl: config.auditTrailUrl,
+  apiKey: config.auditTrailApiKey,
+  enabled: config.auditTrailEnabled,
+});
+
 const toolVisibility = new ToolVisibilityClient({
-  baseUrl: config.agentPlatform.baseUrl,
-  apiKey: config.agentPlatform.apiKey,
-  connector: "workflows",
-  log: (message) => process.stderr.write(`[workflows-mcp][tool-visibility] ${message}\n`),
+  baseUrl: config.agentPlatformUrl,
+  apiKey: config.agentPlatformApiKey,
+  connector: CONNECTOR,
+  log: (m) => log(`[tool-visibility] ${m}`),
 });
 
-// GitHub-style progressive disclosure (off by default — flip
-// MCP_DYNAMIC_TOOLSETS=1 for v1 or MCP_DYNAMIC_TOOLSETS=v2 for the search-
-// based v2 controller). All six workflow tools live in a single auto-derived
-// "workflows" bucket; the v2 meta-tools (search_tools/describe_tools/
-// execute_tool) live in the always-on "_default" bucket.
-//
-// Both controllers are singletons (per-MCP-process) because their per-session
-// state is keyed by SDK session id. Each HTTP request still gets its own
-// `McpServer` via `createMcpServerInstance`, and `applyToSession` is called
-// against that instance with its session id.
-const dynamicToolsets = new DynamicToolsetController({
-  descriptions: {
-    _default: "Meta-tools — always available.",
-    workflows: "MediaDevoted workflow playbooks — list, search, read, create, update, delete.",
-  },
-  log: (m) => process.stderr.write(`[workflows-mcp][dynamic-toolsets] ${m}\n`),
-});
-
-// v2 dynamic toolsets — search-based progressive disclosure. Active when
-// MCP_DYNAMIC_TOOLSETS=v2 is set. v1 controller above is preserved for the
-// legacy MCP_DYNAMIC_TOOLSETS=1 path; v2's three meta-tools replace v1's so
-// the LLM always sees the search-first menu. When the env flag is off, both
-// controllers' applyToSession is a no-op and all tools stay visible.
-//
-// No category overrides — with only six tools in a single "workflows" bucket
-// the auto-derived menu copy is fine. setCategoryMeta() can be added later
-// if the menu phrasing drifts off-intent.
-const dynamicToolsetsV2 = new DynamicToolsetV2Controller({
+const dynamicToolsets = new DynamicToolsetV2Controller({
   serverLabel: "workflows MCP",
-  log: (m) => process.stderr.write(`[workflows-mcp][dynamic-toolsets-v2] ${m}\n`),
+  log: (m) => log(`[dynamic-toolsets-v2] ${m}`),
 });
+dynamicToolsets.setCategoryMeta("workflows", {
+  examples: ["list workflows", "search workflows for cloudflare rotation", "read a workflow playbook"],
+});
+
+const costTracker = new CostTracker();
 
 let embeddingsClient: EmbeddingsClient | null = null;
 let embeddingsStore: EmbeddingsStore | null = null;
+let embeddingsReady = false;
 
-function log(message: string): void {
-  process.stderr.write(`[workflows-mcp] ${message}\n`);
-}
+// ---------------------------------------------------------------------------
+// Resource bodies
+// ---------------------------------------------------------------------------
 
-function text(content: string) {
-  return { content: [{ type: "text" as const, text: content }] };
-}
+const WORKFLOWS_OVERVIEW = `# Workflows MCP
 
-function json(value: unknown) {
-  return text(jsonText(value, config.responseMaxBytes));
-}
+Governed access to the MediaDevoted workflow playbook catalog. Playbooks are
+markdown documents that describe how to combine the OTHER MCPs (namecheap,
+cloudflare, voluum, blast, hosting, ...) to accomplish complex operational
+tasks.
 
-async function governed<T>(
-  args: {
-    toolName: string;
-    permission: string;
-    action: string;
-    resourceType?: string;
-    resourceId?: string;
-    risk?: string;
-    metadata?: Record<string, unknown>;
-  },
-  fn: () => Promise<T>,
-) {
-  const decision = await employeeApi.authorize([args.permission, toolPermissionKey(args.toolName)]);
-  if (!decision.ok) {
-    await employeeApi.audit({
-      action: args.action,
-      resourceType: args.resourceType,
-      resourceId: args.resourceId,
-      risk: args.risk,
-      decision: "deny",
-      status: "skipped",
-      metadata: { reason: decision.reason, ...args.metadata },
-      error: decision.reason,
-    });
-    return json({ ok: false, denied: true, reason: decision.reason });
-  }
-
-  try {
-    const result = await fn();
-    await employeeApi.audit({
-      action: args.action,
-      resourceType: args.resourceType,
-      resourceId: args.resourceId,
-      risk: args.risk,
-      decision: "allow",
-      status: "success",
-      metadata: args.metadata,
-    });
-    return json(result);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await employeeApi.audit({
-      action: args.action,
-      resourceType: args.resourceType,
-      resourceId: args.resourceId,
-      risk: args.risk,
-      decision: "allow",
-      status: "error",
-      metadata: args.metadata,
-      error: message,
-    });
-    return json({ ok: false, error: message });
-  }
-}
-
-function summarize(workflow: WorkflowDto) {
-  return {
-    slug: workflow.slug,
-    title: workflow.title,
-    description: workflow.description,
-    bodyMarkdown: workflow.bodyMarkdown,
-    triggers: workflow.triggers ?? [],
-    connectors: workflow.connectors ?? [],
-    assignedRoles: workflow.assignedRoles ?? [],
-  };
-}
-
-function createMcpServerInstance(): McpServer {
-  const server = new McpServer({
-    name: "workflows-mcp",
-    version: "0.1.1",
-  }, {
-    capabilities: {
-      tools: {},
-      resources: {},
-    },
-  });
-
-  server.resource(
-    "workflows-overview",
-    "workflows://overview",
-    async () => ({
-      contents: [{
-        uri: "workflows://overview",
-        mimeType: "text/markdown",
-        text: `# Workflows MCP
-
-A read-only MCP server that exposes MediaDevoted workflow playbooks — markdown
-documents that describe how to combine the OTHER MCPs (namecheap, cloudflare,
-voluum, blast, hosting, etc.) to accomplish complex operational tasks.
-
-This server is a thin wrapper over agent-platform's \`/workflows\` REST API.
-Auth is per-request: the caller's Employee API bearer key is forwarded to
-agent-platform, which enforces role-based visibility (intersect caller roles
-with each workflow's assignedRoles).
+This server is a thin RBAC-gated wrapper over agent-platform's \`/workflows\`
+REST API. Auth is per-request: the caller's Employee API bearer key is
+forwarded and agent-platform enforces role-based visibility (intersect caller
+roles with each workflow's \`assignedRoles\`).
 
 ## Tools
+- \`workflows_status\` — connector health.
 - \`workflows_list\` — list visible workflows, with optional connector / role / search filters.
-- \`workflows_search\` — search and locally re-rank results.
-- \`workflows_read\` — read one workflow's bodyMarkdown plus any prerequisite (mustReadBefore) workflows.
-`,
-      }],
-    }),
-  );
+- \`workflows_search\` — semantic search via OpenAI embeddings + pgvector cosine similarity. Falls back to literal trigger ranking when embeddings are unavailable.
+- \`workflows_read\` — read one workflow's bodyMarkdown plus any prerequisite (\`mustReadBefore\`) workflows.
+- \`workflows_create\` / \`workflows_update\` / \`workflows_delete\` — manage workflows. Require \`MANAGE_WORKFLOWS\`. Delete is destructive and requires \`confirm=true\`.
+`;
 
-  server.resource(
-    "workflows-how-to-use",
-    "workflows://how-to-use",
-    async () => ({
-      contents: [{
-        uri: "workflows://how-to-use",
-        mimeType: "text/markdown",
-        text: `# How to use workflows-mcp
+const WORKFLOWS_SAFETY = `# Workflows Safety Rules
+
+- All write tools require \`MANAGE_WORKFLOWS\`. Read tools require \`WORKFLOWS_READ\` (admin perms satisfy both).
+- \`workflows_delete\` is destructive — pass \`confirm=true\` AND an \`approval_note\` to dispatch, or \`dry_run=true\` to preview.
+- Workflow content is consumed verbatim by other agents — keep titles and triggers stable across edits to avoid breaking cross-MCP discovery.
+- Empty \`assignedRoles\` means the workflow is admin-only.
+`;
+
+const WORKFLOWS_OPERATOR_PLAYBOOK = `# How to use workflows-mcp
 
 When the user gives you a task that touches multiple connectors or that has
 operational gotchas (DNS cutovers, domain rotation, campaign launches, etc.),
@@ -214,7 +156,7 @@ operational gotchas (DNS cutovers, domain rotation, campaign launches, etc.),
 ## Pattern
 
 1. \`workflows_list({ connector: "namecheap" })\` — see what playbooks exist for the connector(s) you're about to touch. Or
-   \`workflows_search({ query: "rotate to cloudflare" })\` — keyword search the catalog.
+   \`workflows_search({ query: "rotate to cloudflare" })\` — semantic search the catalog.
 2. Pick the workflow whose triggers/title/description best matches the task. Inspect its \`assignedRoles\` to confirm it's intended for an agent like you.
 3. \`workflows_read({ slug })\` — pulls the full markdown plus any prerequisite workflows (\`Includes\`). **Read the prerequisites first**, then the main workflow.
 4. Follow the playbook's steps. The workflow tells you which other MCPs to call and in what order.
@@ -225,183 +167,351 @@ operational gotchas (DNS cutovers, domain rotation, campaign launches, etc.),
 
 ## Output shape
 - \`workflows_read\` returns \`{ workflow, prerequisites[], instructions }\`. Always honor \`instructions\` and read prerequisites before the main workflow body.
-- 404 → \`{ ok: false, reason: "workflow_not_found" }\`.
-- 403 → \`{ ok: false, denied: true, reason: "workflow_not_assigned_to_your_roles" }\` — the workflow exists but is not assigned to any role you hold; do not try to guess its content.
-`,
-      }],
-    }),
-  );
+- 404 / 403 surface as a normalized \`ToolError\` (\`NOT_FOUND\` / \`DENIED\`).
+`;
 
-  server.resource(
-    "workflows-tools-manifest",
-    "workflows://tools-manifest",
-    async () => ({
-      contents: [{
-        uri: "workflows://tools-manifest",
-        mimeType: "application/json",
-        text: JSON.stringify(manifestPayload({ tool_count: TOOLS_MANIFEST.length }), null, 2),
-      }],
-    }),
-  );
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-  server.tool(
-    "workflows_list",
-    "List workflow playbooks visible to the caller. Optional filters: connector, assignedRole, search. Returns workflow summaries (slug, title, description, triggers, connectors, assignedRoles).",
+const buildManifest = () => buildWorkflowsManifest(config.adminPermissions, config.readPermission, config.writePermission);
+
+function summarize(workflow: WorkflowDto | WorkflowSummary): Record<string, unknown> {
+  const w = workflow as WorkflowDto;
+  return {
+    slug: w.slug,
+    title: w.title,
+    description: w.description,
+    bodyMarkdown: w.bodyMarkdown,
+    triggers: w.triggers ?? [],
+    connectors: w.connectors ?? [],
+    assignedRoles: w.assignedRoles ?? [],
+  };
+}
+
+function reply<T>(result: ToolResult<T>) {
+  return toolResultToContent(result, config.responseMaxBytes);
+}
+
+interface GovernedArgs {
+  toolName: string;
+  permission: string;
+  action: string;
+  resourceType?: string;
+  resourceId?: string;
+  risk?: string;
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Wrap a tool body with RBAC + audit. Maps the identity decision to
+ * `ToolError` and writes one audit row per call.
+ */
+async function governed<T>(args: GovernedArgs, fn: () => Promise<ToolResult<T>>): Promise<ToolResult<T>> {
+  const decision = await identity.authorize([args.permission, toolPermissionKey(args.toolName)]);
+  if (!decision.ok) {
+    await auditTrail.write({
+      action: args.action,
+      resourceType: args.resourceType,
+      resourceId: args.resourceId,
+      risk: args.risk,
+      decision: "deny",
+      status: "skipped",
+      metadata: { reason: decision.error.message, ...args.metadata },
+      error: decision.error.message,
+    });
+    return err(decision.error) as ToolResult<T>;
+  }
+
+  try {
+    const result = await fn();
+    await auditTrail.write({
+      action: args.action,
+      resourceType: args.resourceType,
+      resourceId: args.resourceId,
+      risk: args.risk,
+      decision: "allow",
+      status: result.ok ? "success" : "error",
+      metadata: args.metadata,
+      error: result.ok ? undefined : result.error.message,
+    });
+    return result;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await auditTrail.write({
+      action: args.action,
+      resourceType: args.resourceType,
+      resourceId: args.resourceId,
+      risk: args.risk,
+      decision: "allow",
+      status: "error",
+      metadata: args.metadata,
+      error: message,
+    });
+    return err(errors.internal(message)) as ToolResult<T>;
+  }
+}
+
+function initEmbeddings(): void {
+  if (!config.search.openaiApiKey) {
+    log("semantic search disabled: OPENAI_API_KEY is not set (workflows_search will degrade to trigger ranking)");
+    return;
+  }
+  if (!config.search.syncApiKey) {
+    log("semantic search disabled: no MCP_SYNC_API_KEY available for catalog sync");
+    return;
+  }
+  if (!config.agentPlatformEnabled) {
+    log("semantic search disabled: AGENT_PLATFORM_URL is not set");
+    return;
+  }
+  try {
+    embeddingsClient = new EmbeddingsClient({ apiKey: config.search.openaiApiKey });
+    embeddingsStore = new EmbeddingsStore(config.search.embeddingsDbUrl);
+    const runner = new SyncRunner({
+      agentPlatformBaseUrl: config.agentPlatformUrl,
+      syncApiKey: config.search.syncApiKey,
+      store: embeddingsStore,
+      embeddings: embeddingsClient,
+      batchSize: Math.max(1, config.search.batchSize),
+      intervalMs: config.search.syncIntervalMs,
+      log,
+    });
+    runner.start();
+    embeddingsReady = true;
+    log(`semantic search enabled (interval=${config.search.syncIntervalMs}ms batch=${config.search.batchSize})`);
+  } catch (error) {
+    embeddingsClient = null;
+    embeddingsStore = null;
+    embeddingsReady = false;
+    log(`semantic search init failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Tool registration
+// ---------------------------------------------------------------------------
+
+interface RegisterToolsContext {
+  server: {
+    tool: (name: string, description: string, shape: Record<string, z.ZodTypeAny>, handler: (args: Record<string, unknown>) => Promise<unknown>) => unknown;
+  };
+}
+
+function registerStatus(ctx: RegisterToolsContext): void {
+  const TOOL_NAME = "workflows_status";
+  ctx.server.tool(
+    TOOL_NAME,
+    descriptionForTool(TOOL_NAME),
+    {},
+    async () => reply(
+      ok({
+        connector: CONNECTOR,
+        version: SERVER_VERSION,
+        agent_platform_configured: config.agentPlatformEnabled,
+        audit_trail_configured: config.auditTrailEnabled,
+        auth_disabled: config.employeeAuthDisabled,
+        embeddings_enabled: embeddingsReady,
+        embedded_query_dims: embeddingDimensions,
+      }),
+    ),
+  );
+  tagToolWithPermissionKey(ctx.server, TOOL_NAME, toolPermissionKey(TOOL_NAME));
+}
+
+function registerList(ctx: RegisterToolsContext): void {
+  const TOOL_NAME = "workflows_list";
+  ctx.server.tool(
+    TOOL_NAME,
+    descriptionForTool(TOOL_NAME),
     {
       connector: z.string().optional().describe("Filter by connector tag (e.g. 'namecheap', 'cloudflare')."),
       assignedRole: z.string().optional().describe("Filter to workflows assigned to a specific role."),
       search: z.string().optional().describe("Free-text search forwarded to agent-platform."),
     },
-    async ({ connector, assignedRole, search }) => governed({
-      toolName: "workflows_list",
-      permission: config.employeeApi.readPermission,
-      action: "workflow.list",
-      resourceType: "workflow",
-      metadata: { connector, assignedRole, search },
-    }, async () => {
-      const workflows = await agentPlatform.listWorkflows({ connector, assignedRole, search });
-      return {
-        ok: true,
-        count: workflows.length,
-        workflows,
-        filters: { connector, assignedRole, search },
-      };
-    }),
-  );
-  tagToolWithPermissionKey(server, "workflows_list", toolPermissionKey("workflows_list"));
-  tagToolWithToolset(server, "workflows_list", "workflows");
+    async (raw) => {
+      const connector = typeof raw.connector === "string" ? raw.connector : undefined;
+      const assignedRole = typeof raw.assignedRole === "string" ? raw.assignedRole : undefined;
+      const search = typeof raw.search === "string" ? raw.search : undefined;
 
-  server.tool(
-    "workflows_search",
-    "Semantic search over workflow playbooks via OpenAI embeddings + pgvector cosine similarity. mode='fast' (default) ranks on title+description+triggers; mode='deep' blends in the full body. Falls back to literal trigger ranking when embeddings are unavailable.",
-    {
-      query: z.string().min(1),
-      limit: z.number().int().min(1).max(20).optional().default(5),
-      mode: z.enum(["fast", "deep"]).optional().default("fast"),
+      const result = await governed(
+        {
+          toolName: TOOL_NAME,
+          permission: config.readPermission,
+          action: "workflow.list",
+          resourceType: "workflow",
+          metadata: { connector, assignedRole, search },
+        },
+        async () => {
+          try {
+            const workflows = await agentPlatform.listWorkflows({ connector, assignedRole, search });
+            return ok({
+              count: workflows.length,
+              workflows,
+              filters: { connector, assignedRole, search },
+            });
+          } catch (error) {
+            return err(errors.internal(error instanceof Error ? error.message : String(error)));
+          }
+        },
+      );
+      return reply(result);
     },
-    async ({ query, limit, mode }) => governed({
-      toolName: "workflows_search",
-      permission: config.employeeApi.readPermission,
-      action: "workflow.search",
-      resourceType: "workflow",
-      metadata: { query, limit, mode },
-    }, async () => {
-      // Defensive: mcp-passthrough's execute_tool meta-tool forwards args
-      // directly to the handler, bypassing the Zod schema above. Coerce here
-      // so a missing/non-string query returns a graceful error instead of
-      // crashing in scoreWorkflow or the embeddings client.
-      const safeQuery = typeof query === "string" ? query.trim() : "";
-      const safeLimit = typeof limit === "number" && Number.isFinite(limit) ? limit : 5;
-      const safeMode: SearchMode = mode === "deep" ? "deep" : "fast";
-      if (!safeQuery) {
-        return {
-          ok: false,
-          error: "query_required",
-          query: safeQuery,
-          mode: safeMode,
-        };
-      }
+  );
+  tagToolWithPermissionKey(ctx.server, TOOL_NAME, toolPermissionKey(TOOL_NAME));
+}
 
-      const visibleWorkflows = await agentPlatform.listWorkflows();
-      const visibleSlugs = visibleWorkflows.map((w) => w.slug);
+function registerSearch(ctx: RegisterToolsContext): void {
+  const TOOL_NAME = "workflows_search";
+  ctx.server.tool(
+    TOOL_NAME,
+    descriptionForTool(TOOL_NAME),
+    {
+      query: z.string().min(1).optional().describe("Free-text query. Required."),
+      limit: z.number().int().min(1).max(20).optional().describe("Maximum hits to return (1-20). Default 5."),
+      mode: z.enum(["fast", "deep"]).optional().describe("'fast' ranks on title/description/triggers (default); 'deep' blends in the full body."),
+    },
+    async (raw) => {
+      // Defensive: dynamic-toolsets-v2's execute_tool forwards args to handlers
+      // bypassing Zod, so we coerce here. Without these guards, a missing/
+      // non-string `query` crashed in `scoreWorkflow` and the embeddings
+      // client.
+      const safeQuery = typeof raw.query === "string" ? raw.query.trim() : "";
+      const safeLimit = typeof raw.limit === "number" && Number.isFinite(raw.limit) ? Math.min(Math.max(1, Math.trunc(raw.limit)), 20) : 5;
+      const safeMode: SearchMode = raw.mode === "deep" ? "deep" : "fast";
 
-      if (visibleSlugs.length === 0) {
-        return {
-          ok: true,
-          query: safeQuery,
-          mode: safeMode,
-          total_visible: 0,
-          returned: 0,
-          results: [],
-          embedded_query_dims: embeddingDimensions,
-        };
-      }
+      const result = await governed<unknown>(
+        {
+          toolName: TOOL_NAME,
+          permission: config.readPermission,
+          action: "workflow.search",
+          resourceType: "workflow",
+          metadata: { query: safeQuery, limit: safeLimit, mode: safeMode },
+        },
+        async () => {
+          if (!safeQuery) {
+            return err(errors.missingParam("query", "Pass a non-empty query string."));
+          }
 
-      if (embeddingsClient && embeddingsStore) {
-        try {
-          const vector = await embeddingsClient.embed(safeQuery);
-          const hits: SearchHit[] = await embeddingsStore.query({
-            embedding: vector,
-            visibleSlugs,
-            limit: safeLimit,
-            mode: safeMode,
-          });
-          return {
-            ok: true,
+          let visibleWorkflows: WorkflowSummary[];
+          try {
+            visibleWorkflows = await agentPlatform.listWorkflows();
+          } catch (error) {
+            return err(errors.internal(error instanceof Error ? error.message : String(error)));
+          }
+          const visibleSlugs = visibleWorkflows.map((w) => w.slug);
+
+          if (visibleSlugs.length === 0) {
+            return ok({
+              query: safeQuery,
+              mode: safeMode,
+              total_visible: 0,
+              returned: 0,
+              results: [] as SearchHit[],
+              embedded_query_dims: embeddingDimensions,
+            });
+          }
+
+          if (embeddingsClient && embeddingsStore) {
+            try {
+              const vector = await embeddingsClient.embed(safeQuery);
+              const hits: SearchHit[] = await embeddingsStore.query({
+                embedding: vector,
+                visibleSlugs,
+                limit: safeLimit,
+                mode: safeMode,
+              });
+              return ok({
+                query: safeQuery,
+                mode: safeMode,
+                total_visible: visibleSlugs.length,
+                returned: hits.length,
+                results: hits,
+                embedded_query_dims: embeddingDimensions,
+              });
+            } catch (error) {
+              const tag = error instanceof EmbeddingsUnavailableError
+                ? "embeddings-unavailable"
+                : error instanceof StoreUnavailableError
+                  ? "store-unavailable"
+                  : "search-error";
+              log(`workflows_search degraded (${tag}): ${error instanceof Error ? error.message : String(error)}`);
+            }
+          }
+
+          const ranked = visibleWorkflows
+            .map((workflow) => scoreWorkflow(workflow, safeQuery))
+            .filter((entry) => entry.score > 0)
+            .sort((a, b) => b.score - a.score)
+            .slice(0, safeLimit);
+
+          return ok({
+            degraded: true,
             query: safeQuery,
             mode: safeMode,
             total_visible: visibleSlugs.length,
-            returned: hits.length,
-            results: hits,
-            embedded_query_dims: embeddingDimensions,
-          };
-        } catch (error) {
-          const tag = error instanceof EmbeddingsUnavailableError
-            ? "embeddings-unavailable"
-            : error instanceof StoreUnavailableError
-              ? "store-unavailable"
-              : "search-error";
-          log(`workflows_search degraded (${tag}): ${error instanceof Error ? error.message : String(error)}`);
-        }
-      }
-
-      const ranked = visibleWorkflows
-        .map((workflow) => scoreWorkflow(workflow, safeQuery))
-        .filter((entry) => entry.score > 0)
-        .sort((a, b) => b.score - a.score)
-        .slice(0, safeLimit);
-      return {
-        ok: true,
-        degraded: true,
-        query: safeQuery,
-        mode: safeMode,
-        total_visible: visibleSlugs.length,
-        returned: ranked.length,
-        results: ranked,
-      };
-    }),
-  );
-  tagToolWithPermissionKey(server, "workflows_search", toolPermissionKey("workflows_search"));
-  tagToolWithToolset(server, "workflows_search", "workflows");
-
-  server.tool(
-    "workflows_read",
-    "Read a single workflow's bodyMarkdown plus any prerequisite workflows (mustReadBefore). Returns { workflow, prerequisites[], instructions }. Read prerequisites first.",
-    {
-      slug: z.string().min(1),
+            returned: ranked.length,
+            results: ranked,
+          });
+        },
+      );
+      return reply(result);
     },
-    async ({ slug }) => governed({
-      toolName: "workflows_read",
-      permission: config.employeeApi.readPermission,
-      action: "workflow.read",
-      resourceType: "workflow",
-      resourceId: slug,
-      metadata: { slug },
-    }, async () => {
-      const result = await agentPlatform.readWorkflow(slug);
-      if (!result.ok) {
-        if (result.status === 404) return { ok: false, reason: "workflow_not_found" };
-        if (result.status === 403) return { ok: false, denied: true, reason: "workflow_not_assigned_to_your_roles" };
-        return { ok: false, error: result.reason };
-      }
-      return {
-        ok: true,
-        workflow: summarize(result.workflow),
-        prerequisites: result.includes.map((entry) => ({
-          slug: entry.slug,
-          title: entry.title,
-          bodyMarkdown: entry.bodyMarkdown,
-        })),
-        instructions: "Read prerequisites first, then the main workflow.",
-      };
-    }),
   );
-  tagToolWithPermissionKey(server, "workflows_read", toolPermissionKey("workflows_read"));
-  tagToolWithToolset(server, "workflows_read", "workflows");
+  tagToolWithPermissionKey(ctx.server, TOOL_NAME, toolPermissionKey(TOOL_NAME));
+}
 
-  server.tool(
-    "workflows_create",
-    "Create a new workflow playbook. Slug is normalized to lower-kebab-case server-side. AssignedRoles gates which roles may read it (empty array = admins only). Requires MANAGE_WORKFLOWS.",
+function registerRead(ctx: RegisterToolsContext): void {
+  const TOOL_NAME = "workflows_read";
+  ctx.server.tool(
+    TOOL_NAME,
+    descriptionForTool(TOOL_NAME),
+    {
+      slug: z.string().min(1).describe("Slug of the workflow to read."),
+    },
+    async (raw) => {
+      const slug = typeof raw.slug === "string" ? raw.slug.trim() : "";
+      const result = await governed(
+        {
+          toolName: TOOL_NAME,
+          permission: config.readPermission,
+          action: "workflow.read",
+          resourceType: "workflow",
+          resourceId: slug,
+          metadata: { slug },
+        },
+        async () => {
+          if (!slug) return err(errors.missingParam("slug"));
+          const upstream = await agentPlatform.readWorkflow(slug);
+          if (!upstream.ok) {
+            if (upstream.status === 404) return err(errors.notFound("workflow", slug));
+            if (upstream.status === 403) {
+              return err(errors.denied("workflow_not_assigned_to_your_roles", "Ask an operator to assign this workflow to one of your roles."));
+            }
+            return err(errors.upstreamHttp(upstream.status, upstream.reason));
+          }
+          return ok({
+            workflow: summarize(upstream.workflow),
+            prerequisites: upstream.includes.map((entry) => ({
+              slug: entry.slug,
+              title: entry.title,
+              bodyMarkdown: entry.bodyMarkdown,
+            })),
+            instructions: "Read prerequisites first, then the main workflow.",
+          });
+        },
+      );
+      return reply(result);
+    },
+  );
+  tagToolWithPermissionKey(ctx.server, TOOL_NAME, toolPermissionKey(TOOL_NAME));
+}
+
+function registerCreate(ctx: RegisterToolsContext): void {
+  const TOOL_NAME = "workflows_create";
+  ctx.server.tool(
+    TOOL_NAME,
+    descriptionForTool(TOOL_NAME),
     {
       slug: z.string().min(1).describe("Lowercase kebab-case identifier, e.g. 'rotate-domains'."),
       title: z.string().min(1).describe("Human-readable title shown in lists."),
@@ -411,40 +521,69 @@ operational gotchas (DNS cutovers, domain rotation, campaign launches, etc.),
       connectors: z.array(z.string()).optional().describe("Connector keys this workflow uses (e.g. ['voluum','namecheap'])."),
       mustReadBefore: z.array(z.string()).optional().describe("Slugs of workflows auto-pulled when this one is read."),
       assignedRoles: z.array(z.string()).optional().describe("Role keys that may read this workflow. Empty array = visible only to admins."),
+      dry_run: z.boolean().optional().describe("When true, validate inputs but skip dispatch."),
+      confirm: z.boolean().optional().describe("Must be true for live dispatch."),
+      approval_note: z.string().optional().describe("Optional human-readable note recorded in the audit row."),
     },
-    async (args) => governed({
-      toolName: "workflows_create",
-      permission: "MANAGE_WORKFLOWS",
-      action: "workflow.create",
-      resourceType: "workflow",
-      resourceId: args.slug,
-      risk: "medium",
-      metadata: { slug: args.slug, title: args.title },
-    }, async () => {
-      const result = await agentPlatform.createWorkflow({
-        slug: args.slug,
-        title: args.title,
-        bodyMarkdown: args.bodyMarkdown,
-        description: args.description ?? null,
-        triggers: args.triggers ?? null,
-        connectors: args.connectors ?? null,
-        mustReadBefore: args.mustReadBefore ?? null,
-        assignedRoles: args.assignedRoles ?? null,
-        source: "hermes",
-      });
-      if (!result.ok) {
-        if (result.status === 403) return { ok: false, denied: true, reason: result.reason };
-        return { ok: false, status: result.status, reason: result.reason };
-      }
-      return { ok: true, slug: result.result.slug };
-    }),
-  );
-  tagToolWithPermissionKey(server, "workflows_create", toolPermissionKey("workflows_create"));
-  tagToolWithToolset(server, "workflows_create", "workflows");
+    async (raw) => {
+      const slug = typeof raw.slug === "string" ? raw.slug.trim() : "";
+      const title = typeof raw.title === "string" ? raw.title : "";
+      const bodyMarkdown = typeof raw.bodyMarkdown === "string" ? raw.bodyMarkdown : "";
 
-  server.tool(
-    "workflows_update",
-    "Update an existing workflow playbook. Slug is immutable. List fields (triggers/connectors/mustReadBefore/assignedRoles) are replaced when provided; omit to leave unchanged, pass [] to clear. Requires MANAGE_WORKFLOWS.",
+      const result = await governed<unknown>(
+        {
+          toolName: TOOL_NAME,
+          permission: config.writePermission,
+          action: "workflow.create",
+          resourceType: "workflow",
+          resourceId: slug,
+          risk: "medium",
+          metadata: { slug, title },
+        },
+        async () => {
+          if (!slug) return err(errors.missingParam("slug"));
+          if (!title) return err(errors.missingParam("title"));
+          if (!bodyMarkdown) return err(errors.missingParam("bodyMarkdown"));
+
+          const gate = checkApprovalGate(raw as { dry_run?: unknown; confirm?: unknown; approval_note?: unknown });
+          if (!gate.ok) return err(gate.error);
+          if (gate.dryRun) {
+            return ok({
+              dry_run: true,
+              would_create: { slug, title, description: raw.description, assignedRoles: raw.assignedRoles ?? null },
+            });
+          }
+
+          const upstream = await agentPlatform.createWorkflow({
+            slug,
+            title,
+            bodyMarkdown,
+            description: typeof raw.description === "string" ? raw.description : null,
+            triggers: Array.isArray(raw.triggers) ? (raw.triggers as string[]) : null,
+            connectors: Array.isArray(raw.connectors) ? (raw.connectors as string[]) : null,
+            mustReadBefore: Array.isArray(raw.mustReadBefore) ? (raw.mustReadBefore as string[]) : null,
+            assignedRoles: Array.isArray(raw.assignedRoles) ? (raw.assignedRoles as string[]) : null,
+            source: "hermes",
+          });
+          if (!upstream.ok) {
+            if (upstream.status === 403) return err(errors.denied(upstream.reason));
+            if (upstream.status === 400) return err(errors.validation(upstream.reason));
+            return err(errors.upstreamHttp(upstream.status, upstream.reason));
+          }
+          return ok({ slug: upstream.result.slug });
+        },
+      );
+      return reply(result);
+    },
+  );
+  tagToolWithPermissionKey(ctx.server, TOOL_NAME, toolPermissionKey(TOOL_NAME));
+}
+
+function registerUpdate(ctx: RegisterToolsContext): void {
+  const TOOL_NAME = "workflows_update";
+  ctx.server.tool(
+    TOOL_NAME,
+    descriptionForTool(TOOL_NAME),
     {
       slug: z.string().min(1).describe("Slug of the workflow to update."),
       title: z.string().min(1),
@@ -454,354 +593,219 @@ operational gotchas (DNS cutovers, domain rotation, campaign launches, etc.),
       connectors: z.array(z.string()).optional(),
       mustReadBefore: z.array(z.string()).optional(),
       assignedRoles: z.array(z.string()).optional(),
+      dry_run: z.boolean().optional(),
+      confirm: z.boolean().optional(),
+      approval_note: z.string().optional(),
     },
-    async (args) => governed({
-      toolName: "workflows_update",
-      permission: "MANAGE_WORKFLOWS",
-      action: "workflow.update",
-      resourceType: "workflow",
-      resourceId: args.slug,
-      risk: "medium",
-      metadata: { slug: args.slug, title: args.title },
-    }, async () => {
-      const result = await agentPlatform.updateWorkflow(args.slug, {
-        title: args.title,
-        bodyMarkdown: args.bodyMarkdown,
-        description: args.description ?? null,
-        triggers: args.triggers ?? null,
-        connectors: args.connectors ?? null,
-        mustReadBefore: args.mustReadBefore ?? null,
-        assignedRoles: args.assignedRoles ?? null,
-        source: "hermes",
-      });
-      if (!result.ok) {
-        if (result.status === 404) return { ok: false, reason: "workflow_not_found" };
-        if (result.status === 403) return { ok: false, denied: true, reason: result.reason };
-        return { ok: false, status: result.status, reason: result.reason };
-      }
-      return { ok: true, slug: args.slug.trim().toLowerCase() };
-    }),
-  );
-  tagToolWithPermissionKey(server, "workflows_update", toolPermissionKey("workflows_update"));
-  tagToolWithToolset(server, "workflows_update", "workflows");
+    async (raw) => {
+      const slug = typeof raw.slug === "string" ? raw.slug.trim() : "";
+      const title = typeof raw.title === "string" ? raw.title : "";
+      const bodyMarkdown = typeof raw.bodyMarkdown === "string" ? raw.bodyMarkdown : "";
 
-  server.tool(
-    "workflows_delete",
-    "Delete a workflow playbook. DESTRUCTIVE — confirm must be true. References from other workflows' mustReadBefore are silently skipped after delete. Requires MANAGE_WORKFLOWS.",
-    {
-      slug: z.string().min(1).describe("Slug of the workflow to delete."),
-      confirm: z.boolean().describe("Must be true; rejects otherwise. Forces an explicit second-step confirmation."),
-    },
-    async ({ slug, confirm }) => governed({
-      toolName: "workflows_delete",
-      permission: "MANAGE_WORKFLOWS",
-      action: "workflow.delete",
-      resourceType: "workflow",
-      resourceId: slug,
-      risk: "high",
-      metadata: { slug, confirm },
-    }, async () => {
-      if (!confirm) {
-        return {
-          ok: false,
-          reason: "confirmation_required",
-          message: "Pass confirm=true to proceed. This deletes the workflow permanently.",
-        };
-      }
-      const result = await agentPlatform.deleteWorkflow(slug);
-      if (!result.ok) {
-        if (result.status === 404) return { ok: false, reason: "workflow_not_found" };
-        if (result.status === 403) return { ok: false, denied: true, reason: result.reason };
-        return { ok: false, status: result.status, reason: result.reason };
-      }
-      return { ok: true, deleted: slug.trim().toLowerCase() };
-    }),
-  );
-  tagToolWithPermissionKey(server, "workflows_delete", toolPermissionKey("workflows_delete"));
-  tagToolWithToolset(server, "workflows_delete", "workflows");
+      const result = await governed<unknown>(
+        {
+          toolName: TOOL_NAME,
+          permission: config.writePermission,
+          action: "workflow.update",
+          resourceType: "workflow",
+          resourceId: slug,
+          risk: "medium",
+          metadata: { slug, title },
+        },
+        async () => {
+          if (!slug) return err(errors.missingParam("slug"));
+          if (!title) return err(errors.missingParam("title"));
+          if (!bodyMarkdown) return err(errors.missingParam("bodyMarkdown"));
 
-  // ---------------------------------------------------------------------------
-  // Dynamic-toolsets v2 meta-tools — search_tools / describe_tools / execute_tool.
-  // No v1 equivalents were registered for workflows-mcp; v2 is the only shape.
-  // Always registered; effectively no-ops on visibility until
-  // MCP_DYNAMIC_TOOLSETS=v2 flips on (controller.applyToSession is a no-op
-  // when the flag is unset, and search/describe still work cheaply even if
-  // no tools are gated — useful for ad-hoc catalog browsing).
-  // ---------------------------------------------------------------------------
-  const metaToolSessionId = (extra: { sessionId?: string }): string => extra.sessionId ?? "default";
+          const gate = checkApprovalGate(raw as { dry_run?: unknown; confirm?: unknown; approval_note?: unknown });
+          if (!gate.ok) return err(gate.error);
+          if (gate.dryRun) {
+            return ok({
+              dry_run: true,
+              would_update: { slug, title, description: raw.description },
+            });
+          }
 
-  // We can't render the categorical overview for search_tools.description
-  // until after all tools (passthrough + meta) have been registered and
-  // tagged. Register the meta-tools with placeholder descriptions first, then
-  // call controller.renderSearchToolDescription(server) below to overwrite
-  // search_tools' description with the auto-generated menu.
-  const searchToolReg = server.tool(
-    META_TOOL_SCHEMAS_V2.search_tools.name,
-    META_TOOL_SCHEMAS_V2.search_tools.description,
-    META_TOOL_ZOD_SHAPES_V2.search_tools,
-    async (args) => {
-      const query = (args.query ?? "").trim();
-      if (!query) return json({ ok: false, error: "query_required" });
-      const limit = args.limit ?? 10;
-      try {
-        const hits = dynamicToolsetsV2.search(server, query, limit);
-        return json({ ok: true, query, count: hits.length, results: hits });
-      } catch (error) {
-        return json({ ok: false, error: error instanceof Error ? error.message : String(error) });
-      }
+          const upstream = await agentPlatform.updateWorkflow(slug, {
+            title,
+            bodyMarkdown,
+            description: typeof raw.description === "string" ? raw.description : null,
+            triggers: Array.isArray(raw.triggers) ? (raw.triggers as string[]) : null,
+            connectors: Array.isArray(raw.connectors) ? (raw.connectors as string[]) : null,
+            mustReadBefore: Array.isArray(raw.mustReadBefore) ? (raw.mustReadBefore as string[]) : null,
+            assignedRoles: Array.isArray(raw.assignedRoles) ? (raw.assignedRoles as string[]) : null,
+            source: "hermes",
+          });
+          if (!upstream.ok) {
+            if (upstream.status === 404) return err(errors.notFound("workflow", slug));
+            if (upstream.status === 403) return err(errors.denied(upstream.reason));
+            if (upstream.status === 400) return err(errors.validation(upstream.reason));
+            return err(errors.upstreamHttp(upstream.status, upstream.reason));
+          }
+          return ok({ slug: slug.toLowerCase() });
+        },
+      );
+      return reply(result);
     },
   );
-  dynamicToolsets.setToolsetOverride(META_TOOL_SCHEMAS_V2.search_tools.name, "_default");
-  dynamicToolsetsV2.setToolsetOverride(META_TOOL_SCHEMAS_V2.search_tools.name, "_default");
-
-  server.tool(
-    META_TOOL_SCHEMAS_V2.describe_tools.name,
-    META_TOOL_SCHEMAS_V2.describe_tools.description,
-    META_TOOL_ZOD_SHAPES_V2.describe_tools,
-    async (args, extra) => {
-      const names = Array.isArray(args.names) ? args.names.map((n) => String(n).trim()).filter(Boolean) : [];
-      if (names.length === 0) return json({ ok: false, error: "names_required" });
-      if (names.length > 10) return json({ ok: false, error: "max_10_names_per_call" });
-      try {
-        const described = dynamicToolsetsV2.describe(server, metaToolSessionId(extra), names);
-        return json({ ok: true, tools: described });
-      } catch (error) {
-        return json({ ok: false, error: error instanceof Error ? error.message : String(error) });
-      }
-    },
-  );
-  dynamicToolsets.setToolsetOverride(META_TOOL_SCHEMAS_V2.describe_tools.name, "_default");
-  dynamicToolsetsV2.setToolsetOverride(META_TOOL_SCHEMAS_V2.describe_tools.name, "_default");
-
-  server.tool(
-    META_TOOL_SCHEMAS_V2.execute_tool.name,
-    META_TOOL_SCHEMAS_V2.execute_tool.description,
-    META_TOOL_ZOD_SHAPES_V2.execute_tool,
-    async (args, extra) => {
-      const name = String(args.name ?? "").trim();
-      if (!name) return json({ ok: false, error: "name_required" });
-      const routed = dynamicToolsetsV2.routeExecute(server, metaToolSessionId(extra), name);
-      if (!routed) return json({ ok: false, error: `unknown_tool:${name}` });
-      try {
-        // routed.tool.handler is the registered SDK callback. Invoke it with
-        // the supplied args object. We bypass tools/call so the SDK doesn't
-        // re-route through this meta-tool.
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const result = await (routed.tool as any).handler(args.args ?? {}, extra);
-        return result;
-      } catch (error) {
-        return json({ ok: false, error: error instanceof Error ? error.message : String(error) });
-      }
-    },
-  );
-  dynamicToolsets.setToolsetOverride(META_TOOL_SCHEMAS_V2.execute_tool.name, "_default");
-  dynamicToolsetsV2.setToolsetOverride(META_TOOL_SCHEMAS_V2.execute_tool.name, "_default");
-
-  // Render the categorical overview AFTER all tools (passthrough + meta) are
-  // registered and tagged. This builds the "menu" the LLM sees in tools/list
-  // and is the single most important behavioural lever in v2 — without it
-  // the model never reaches for search_tools.
-  try {
-    const overview = dynamicToolsetsV2.renderSearchToolDescription(server);
-    searchToolReg.update({ description: overview });
-  } catch (error) {
-    log(`dynamic-toolsets-v2: failed to render search_tools description: ${error instanceof Error ? error.message : String(error)}`);
-  }
-
-  // Apply the current tool-visibility hidden set and re-apply whenever it
-  // refreshes. Disabled tools disappear from tools/list and reject tools/call
-  // at the SDK level, so the LLM never sees the hidden surface.
-  applyHiddenFilter(server, toolVisibility);
-  const unsubscribe = toolVisibility.onChange(() => applyHiddenFilter(server, toolVisibility));
-  // Drop the subscription when the underlying transport closes so we don't
-  // leak listeners across reconnected HTTP sessions.
-  const originalClose = server.close.bind(server);
-  server.close = async () => {
-    unsubscribe();
-    await originalClose();
-  };
-
-  return server;
+  tagToolWithPermissionKey(ctx.server, TOOL_NAME, toolPermissionKey(TOOL_NAME));
 }
 
+function registerDelete(ctx: RegisterToolsContext): void {
+  const TOOL_NAME = "workflows_delete";
+  ctx.server.tool(
+    TOOL_NAME,
+    descriptionForTool(TOOL_NAME),
+    {
+      slug: z.string().min(1).describe("Slug of the workflow to delete."),
+      dry_run: z.boolean().optional().describe("When true, validate inputs but skip dispatch."),
+      confirm: z.boolean().optional().describe("Must be true; rejects otherwise. Forces an explicit second-step confirmation."),
+      approval_note: z.string().optional().describe("Human-readable rationale recorded in the audit row."),
+    },
+    async (raw) => {
+      const slug = typeof raw.slug === "string" ? raw.slug.trim() : "";
+      const result = await governed<unknown>(
+        {
+          toolName: TOOL_NAME,
+          permission: config.writePermission,
+          action: "workflow.delete",
+          resourceType: "workflow",
+          resourceId: slug,
+          risk: "high",
+          metadata: { slug },
+        },
+        async () => {
+          if (!slug) return err(errors.missingParam("slug"));
+          const gate = checkApprovalGate(raw as { dry_run?: unknown; confirm?: unknown; approval_note?: unknown });
+          if (!gate.ok) return err(gate.error);
+          if (gate.dryRun) {
+            return ok({ dry_run: true, would_delete: slug });
+          }
+
+          const upstream = await agentPlatform.deleteWorkflow(slug);
+          if (!upstream.ok) {
+            if (upstream.status === 404) return err(errors.notFound("workflow", slug));
+            if (upstream.status === 403) return err(errors.denied(upstream.reason));
+            return err(errors.upstreamHttp(upstream.status, upstream.reason));
+          }
+          return ok({ deleted: slug.toLowerCase() });
+        },
+      );
+      return reply(result);
+    },
+  );
+  tagToolWithPermissionKey(ctx.server, TOOL_NAME, toolPermissionKey(TOOL_NAME));
+}
+
+export function registerWorkflowsTools(server: RegisterToolsContext["server"]): void {
+  const ctx: RegisterToolsContext = { server };
+  registerStatus(ctx);
+  registerList(ctx);
+  registerSearch(ctx);
+  registerRead(ctx);
+  registerCreate(ctx);
+  registerUpdate(ctx);
+  registerDelete(ctx);
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
 async function main(): Promise<void> {
-  log(`transport=${config.transport} agentPlatform=${config.agentPlatform.baseUrl || "(unset)"} employeeApi=${config.employeeApi.baseUrl}`);
-  if (config.employeeApi.authDisabled) log("Employee API auth disabled by EMPLOYEE_AUTH_DISABLED=true");
+  log(`transport=${config.transport} agentPlatform=${config.agentPlatformUrl || "(unset)"} employeeApi=${config.employeeApiUrl}`);
+  if (config.employeeAuthDisabled) log("Employee API auth disabled by EMPLOYEE_AUTH_DISABLED=true");
 
   await syncCatalogOnBoot({
-    serverName: "workflows-mcp",
-    manifest: manifestPayload({ tool_count: TOOLS_MANIFEST.length }),
-    employeeApi: config.employeeApi,
-    agentPlatform: config.agentPlatform,
+    serverName: SERVER_NAME,
+    manifest: buildManifest(),
+    identity,
+    agentPlatform: {
+      baseUrl: config.agentPlatformUrl,
+      apiKey: config.agentPlatformApiKey,
+      enabled: config.agentPlatformEnabled,
+      allowedTeams: config.allowedTeams,
+    },
+    adminPermissions: config.adminPermissions,
     log,
   });
 
-  // Prime the hidden-tools cache before any tools/list call goes out, then
-  // start the background refresh. Empty set on first boot is the default —
-  // existing behavior is preserved when agent-platform has no entries.
-  await toolVisibility.refresh();
-  toolVisibility.startBackgroundRefresh();
-  log(`tool-visibility: ${toolVisibility.getHiddenCount()} tool(s) hidden`);
+  initEmbeddings();
 
-  if (!config.search.openaiApiKey) {
-    log("semantic search disabled: OPENAI_API_KEY is not set (workflows_search will degrade to trigger ranking)");
-  } else if (!config.search.syncApiKey) {
-    log("semantic search disabled: no MCP_SYNC_API_KEY available for catalog sync");
-  } else if (!config.agentPlatform.enabled) {
-    log("semantic search disabled: AGENT_PLATFORM_URL is not set");
-  } else {
-    try {
-      embeddingsClient = new EmbeddingsClient({ apiKey: config.search.openaiApiKey });
-      embeddingsStore = new EmbeddingsStore(config.search.embeddingsDbUrl);
-      const runner = new SyncRunner({
-        agentPlatformBaseUrl: config.agentPlatform.baseUrl,
-        syncApiKey: config.search.syncApiKey,
-        store: embeddingsStore,
-        embeddings: embeddingsClient,
-        batchSize: Math.max(1, config.search.batchSize),
-        intervalMs: config.search.syncIntervalMs,
-        log,
-      });
-      runner.start();
-      log(`semantic search enabled (interval=${config.search.syncIntervalMs}ms batch=${config.search.batchSize})`);
-    } catch (error) {
-      embeddingsClient = null;
-      embeddingsStore = null;
-      log(`semantic search init failed: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
+  // workflows-mcp has no per-tenant accounts — the server-level instructions
+  // just point the LLM at the operator playbook.
+  const accountHints = buildAccountHints<{ id: string; label?: string }>([], {
+    baseInstructions:
+      "Workflows MCP — governed access to the MediaDevoted workflow playbook catalog. RBAC-gated read + write tools over the agent-platform `/workflows` API.",
+    grantHint: "All callers see the workflow catalog scoped to roles they hold. To author workflows, the caller needs MANAGE_WORKFLOWS.",
+  });
+  const instructions = `${accountHints}\n\n${WORKFLOWS_OPERATOR_PLAYBOOK}`;
 
-  if (config.transport === "http") {
-    const sessions = new Map<string, StreamableHTTPServerTransport>();
-    const httpServer = createServer(async (req, res) => {
-      const url = new URL(req.url ?? "/", `http://localhost:${config.port}`);
+  const handle = await runMcpServer({
+    name: SERVER_NAME,
+    version: SERVER_VERSION,
+    transport: config.transport,
+    port: config.port,
+    mcpAuthToken: config.mcpAuthToken,
+    identity,
+    adminPermissions: config.adminPermissions,
+    dynamicToolsets,
+    toolVisibility,
+    costTracker,
+    instructions,
+    manifestPayload: buildManifest,
+    healthPayload: () => ({
+      status: "ok",
+      agent_platform: config.agentPlatformEnabled ? "configured" : "unset",
+      auth_disabled: config.employeeAuthDisabled,
+      embeddings_enabled: embeddingsReady,
+    }),
+    log,
+    buildInstance: async () => {
+      const { McpServer } = await import("@modelcontextprotocol/sdk/server/mcp.js");
+      const server = new McpServer(
+        { name: SERVER_NAME, version: SERVER_VERSION },
+        { capabilities: { tools: {}, resources: {} }, instructions },
+      );
 
-      if (url.pathname === "/manifest" || url.pathname === "/tools-manifest") {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(manifestPayload({ tool_count: TOOLS_MANIFEST.length })));
-        return;
-      }
+      registerCommonResources(
+        server,
+        CONNECTOR,
+        {
+          overview: WORKFLOWS_OVERVIEW,
+          safety: WORKFLOWS_SAFETY,
+          operatorPlaybook: WORKFLOWS_OPERATOR_PLAYBOOK,
+        },
+        buildManifest,
+      );
 
-      if (url.pathname === "/health") {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ status: "ok" }));
-        return;
-      }
+      registerWorkflowsTools(server as unknown as RegisterToolsContext["server"]);
 
-      if (url.pathname !== "/mcp") {
-        res.writeHead(404);
-        res.end("Not found");
-        return;
-      }
+      return { server };
+    },
+  });
 
-      if (config.mcpAuthToken) {
-        const queryToken = url.searchParams.get("auth");
-        const headerToken = req.headers["x-mcp-auth-token"];
-        const token = Array.isArray(headerToken) ? headerToken[0] : headerToken;
-        if (queryToken !== config.mcpAuthToken && token !== config.mcpAuthToken) {
-          res.writeHead(401, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Unauthorized" }));
-          return;
-        }
-      }
+  log(`${SERVER_NAME} ready${handle.port ? ` on :${handle.port}` : ""}`);
+}
 
-      const handle = async () => {
-        if (req.method === "GET") {
-          const sessionId = req.headers["mcp-session-id"] as string | undefined;
-          if (sessionId && sessions.has(sessionId)) {
-            await sessions.get(sessionId)!.handleRequest(req, res);
-            return;
-          }
-          res.writeHead(405, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Method Not Allowed — use POST to initialize" }));
-          return;
-        }
-
-        if (req.method === "DELETE") {
-          const sessionId = req.headers["mcp-session-id"] as string | undefined;
-          if (sessionId && sessions.has(sessionId)) {
-            sessions.delete(sessionId);
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ status: "session deleted" }));
-          } else {
-            res.writeHead(404, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Session not found" }));
-          }
-          return;
-        }
-
-        const sessionId = req.headers["mcp-session-id"] as string | undefined;
-        let transport: StreamableHTTPServerTransport;
-        if (sessionId && sessions.has(sessionId)) {
-          transport = sessions.get(sessionId)!;
-        } else if (!sessionId && req.method === "POST") {
-          transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => randomUUID(),
-            onsessioninitialized: (newSessionId) => {
-              sessions.set(newSessionId, transport);
-              log(`new session ${newSessionId}`);
-            },
-          });
-          transport.onclose = () => {
-            const sid = transport.sessionId;
-            if (sid) {
-              sessions.delete(sid);
-              // Free per-session dynamic-toolset state so the controllers don't
-              // grow unbounded across long-lived MCP processes.
-              dynamicToolsets.releaseSession(sid);
-              dynamicToolsetsV2.releaseSession(sid);
-            }
-          };
-          const sessionServer = createMcpServerInstance();
-          await sessionServer.connect(transport);
-          // Filter tools/list to what this caller can actually call. Per-session
-          // because each session gets its own McpServer + its own caller. Fails
-          // open on introspect error / auth-disabled / missing-key.
-          await applyPermissionFilterForRequest(sessionServer, req.headers, {
-            employeeApi,
-            adminPermissions: config.employeeApi.adminPermissions,
-            log: (m) => log(`tools-list-filter: ${m}`),
-          });
-          // Layer the dynamic-toolsets filter on top of permission filtering.
-          // Order matters: permission filter runs first (it hides what the
-          // caller can't call at all), then dynamic-toolsets hides the
-          // long-tail buckets until the LLM reveals them via search/describe
-          // (v2) or enable_toolset (v1). Both layers only ever flip ON → OFF,
-          // so they compose without fighting each other. v1 is a no-op unless
-          // MCP_DYNAMIC_TOOLSETS=1; v2 is a no-op unless MCP_DYNAMIC_TOOLSETS=v2.
-          const sid = transport.sessionId ?? "default";
-          dynamicToolsets.applyToSession(sessionServer, sid);
-          dynamicToolsetsV2.applyToSession(sessionServer, sid);
-        } else {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Bad request — no valid session" }));
-          return;
-        }
-
-        await transport.handleRequest(req, res);
-      };
-
-      await runWithRequestContext({ employeeApiKey: employeeApiKeyFromHeaders(req) }, handle);
-    });
-
-    httpServer.listen(config.port, () => {
-      log(`listening on http://0.0.0.0:${config.port}/mcp`);
-    });
-  } else {
-    const server = createMcpServerInstance();
-    await server.connect(new StdioServerTransport());
-    // Apply the dynamic-toolsets filter once for the single stdio session.
-    // Permission filtering is HTTP-only (it reads the Employee API key from
-    // request headers), so the stdio path goes straight to the toolset filter.
-    // v1: no-op unless MCP_DYNAMIC_TOOLSETS=1. v2: no-op unless
-    // MCP_DYNAMIC_TOOLSETS=v2.
-    dynamicToolsets.applyToSession(server, "default");
-    dynamicToolsetsV2.applyToSession(server, "default");
-    log("running on stdio");
+// Only run the server when this module is the entrypoint. Importing it from
+// the contract-suite test pulls in `registerWorkflowsTools` + `buildManifest`
+// without booting the HTTP transport.
+function isEntrypoint(): boolean {
+  try {
+    const entry = process.argv[1] ?? "";
+    return entry.endsWith("/dist/index.js") || entry.endsWith("/src/index.ts") || entry.endsWith("workflows-mcp");
+  } catch {
+    return true;
   }
 }
 
-main().catch((error) => {
-  process.stderr.write(`[workflows-mcp] fatal: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
-  process.exit(1);
-});
+if (isEntrypoint() && process.env.WORKFLOWS_MCP_SKIP_MAIN !== "1") {
+  main().catch((error) => {
+    process.stderr.write(`[${SERVER_NAME}] fatal: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
+    process.exit(1);
+  });
+}
+
+// Re-export for the contract suite.
+export { buildManifest, TOOL_NAMES, annotationsForTool };
