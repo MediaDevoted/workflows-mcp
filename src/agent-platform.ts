@@ -1,5 +1,11 @@
-import type { AgentPlatformClientConfig } from "./config.js";
 import { currentEmployeeApiKey } from "@mediadevoted/mcp-passthrough/request-context";
+
+export interface AgentPlatformClientConfig {
+  baseUrl: string;
+  apiKey: string;
+  enabled: boolean;
+  allowedTeams: string[];
+}
 
 export interface WorkflowSummary {
   slug: string;
