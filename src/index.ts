@@ -31,10 +31,10 @@ import {
   type ToolResult,
 } from "@mediadevoted/mcp-passthrough";
 import { checkApprovalGate } from "@mediadevoted/mcp-passthrough/approval-gate";
+import { AuditTrailClient } from "@mediadevoted/mcp-passthrough/audit-trail";
 import { tagToolWithPermissionKey } from "@mediadevoted/mcp-passthrough/tools-list-filter";
 import { z } from "zod";
 import { AgentPlatformClient, type WorkflowDto, type WorkflowSummary } from "./agent-platform.js";
-import { AuditTrailClient } from "./audit-trail.js";
 import { loadConfig } from "./config.js";
 import {
   annotationsForTool,
@@ -88,6 +88,7 @@ const agentPlatform = new AgentPlatformClient({
 });
 
 const auditTrail = new AuditTrailClient({
+  connector: CONNECTOR,
   baseUrl: config.auditTrailUrl,
   apiKey: config.auditTrailApiKey,
   enabled: config.auditTrailEnabled,
