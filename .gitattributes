@@ -1,0 +1,21 @@
+# Normalize line endings to LF on commit across all platforms.
+* text=auto eol=lf
+
+# Explicitly declare text files that should always be normalized.
+*.ts    text eol=lf
+*.js    text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.sh    text eol=lf
+*.env*  text eol=lf
+
+# Binary files — never diff or merge.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.woff  binary
+*.woff2 binary
