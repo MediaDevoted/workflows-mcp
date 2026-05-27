@@ -109,6 +109,19 @@ dynamicToolsets.setCategoryMeta("workflows", {
   examples: ["list workflows", "search workflows for cloudflare rotation", "read a workflow playbook"],
 });
 
+// Pin every workflow tool to `_default` so they're always visible alongside
+// the v2 meta-tools at session start. workflows-mcp is operator-procedural by
+// nature — the entire surface is small (7 tools) and routes from procedural
+// intents in SOUL.md, so progressive disclosure would just add a
+// search_tools → describe_tools → call round-trip for every workflow lookup.
+// Keeping them in `_default` removes that ~7.5s + 4500-token tax per turn.
+//
+// The three v2 meta-tools (search_tools, describe_tools, execute_tool) are
+// pinned to `_default` automatically by runMcpServer.
+for (const name of TOOL_NAMES) {
+  dynamicToolsets.setToolsetOverride(name, "_default");
+}
+
 const costTracker = new CostTracker();
 
 let embeddingsClient: EmbeddingsClient | null = null;
@@ -126,6 +139,10 @@ markdown documents that describe how to combine the OTHER MCPs (namecheap,
 cloudflare, voluum, blast, hosting, ...) to accomplish complex operational
 tasks.
 
+**workflows BEAT memory.** When the user asks anything procedural,
+\`workflows_search\` FIRST and follow the playbook verbatim. Operator-curated
+playbooks are authoritative — do not improvise from training data.
+
 This server is a thin RBAC-gated wrapper over agent-platform's \`/workflows\`
 REST API. Auth is per-request: the caller's Employee API bearer key is
 forwarded and agent-platform enforces role-based visibility (intersect caller
@@ -134,9 +151,9 @@ roles with each workflow's \`assignedRoles\`).
 ## Tools
 - \`workflows_status\` — connector health.
 - \`workflows_list\` — list visible workflows, with optional connector / role / search filters.
-- \`workflows_search\` — semantic search via OpenAI embeddings + pgvector cosine similarity. Falls back to literal trigger ranking when embeddings are unavailable.
-- \`workflows_read\` — read one workflow's bodyMarkdown plus any prerequisite (\`mustReadBefore\`) workflows.
-- \`workflows_create\` / \`workflows_update\` / \`workflows_delete\` — manage workflows. Require \`MANAGE_WORKFLOWS\`. Delete is destructive and requires \`confirm=true\`.
+- \`workflows_search\` — semantic search via OpenAI embeddings + pgvector cosine similarity. Falls back to literal trigger ranking when embeddings are unavailable. **Use this first for any procedural intent.**
+- \`workflows_read\` — read one workflow's bodyMarkdown plus any prerequisite (\`mustReadBefore\`) workflows. Read prerequisites FIRST.
+- \`workflows_create\` / \`workflows_update\` / \`workflows_delete\` — manage workflows. Require \`MANAGE_WORKFLOWS\`. Delete is destructive and requires \`confirm=true\`. **Authoring is operator work — do not call on agent initiative.**
 `;
 
 const WORKFLOWS_SAFETY = `# Workflows Safety Rules
@@ -149,25 +166,51 @@ const WORKFLOWS_SAFETY = `# Workflows Safety Rules
 
 const WORKFLOWS_OPERATOR_PLAYBOOK = `# How to use workflows-mcp
 
-When the user gives you a task that touches multiple connectors or that has
-operational gotchas (DNS cutovers, domain rotation, campaign launches, etc.),
-**ask the workflow catalog first** before improvising.
+**workflows BEAT memory.** Operator-curated playbooks are authoritative. When
+the user asks anything procedural — a task that touches multiple connectors,
+or has operational gotchas (DNS cutovers, domain rotation, campaign launches,
+auto-zero, retests, audits) — ask the catalog FIRST. Do not improvise from
+training data. Operators have validated the exact sequence of steps; "looks
+redundant" is a trap and skipped steps are the most common cause of
+cross-connector outages.
+
+## Routing — procedural intents go through workflows_search FIRST
+
+These verbs almost always map to a playbook — search before doing anything:
+
+- "revalidate" / "retest" / "audit"
+- "onboard" / "launch" / "cutover" / "migrate"
+- "rotate" (domains, IPs, accounts)
+- "auto-zero" / "pause stalled" / "rebalance"
+- "set up" / "configure for the first time"
+- "what's the process for..." / "how do I..."
+
+If the user's phrasing has any of those shapes, your first call should be
+\`workflows_search({ query: "<the user's task in their own words>" })\`.
+
+## Routing — data lookups go to connector MCPs, NOT workflows
+
+These are NOT procedural — call the connector directly:
+
+- "list X" / "show me X" / "get X by id" — voluum / cloudflare / namecheap / etc.
+- "what's the current state of Y" — direct tool call
+- "search for Z" (entity search, not workflow search) — connector's own search
+- Single-step trivia ("what's my Namecheap balance")
 
 ## Pattern
 
-1. \`workflows_list({ connector: "namecheap" })\` — see what playbooks exist for the connector(s) you're about to touch. Or
-   \`workflows_search({ query: "rotate to cloudflare" })\` — semantic search the catalog.
-2. Pick the workflow whose triggers/title/description best matches the task. Inspect its \`assignedRoles\` to confirm it's intended for an agent like you.
-3. \`workflows_read({ slug })\` — pulls the full markdown plus any prerequisite workflows (\`Includes\`). **Read the prerequisites first**, then the main workflow.
-4. Follow the playbook's steps. The workflow tells you which other MCPs to call and in what order.
-
-## When NOT to use
-- Single-step trivia (e.g. "what's my Namecheap balance") — just call the tool directly.
-- The workflow catalog is empty for this connector — fall back to your normal reasoning.
+1. \`workflows_search({ query })\` — semantic search. Or \`workflows_list({ connector })\` when you know the connector and want to scan playbooks for it.
+2. Pick the workflow whose triggers / title / description best match the task. Inspect \`assignedRoles\` to confirm it's intended for an agent in your role.
+3. \`workflows_read({ slug })\` — pulls the full markdown plus any \`mustReadBefore\` prerequisites. **Read prerequisites FIRST**, then the main workflow body.
+4. Follow the playbook's steps verbatim. The workflow tells you which other MCPs to call and in what order. Do NOT reorder. Do NOT skip steps. Do NOT substitute "equivalent" calls. If a step seems wrong, STOP and ask the operator — do not improvise.
 
 ## Output shape
 - \`workflows_read\` returns \`{ workflow, prerequisites[], instructions }\`. Always honor \`instructions\` and read prerequisites before the main workflow body.
-- 404 / 403 surface as a normalized \`ToolError\` (\`NOT_FOUND\` / \`DENIED\`).
+- 404 / 403 surface as a normalized \`ToolError\` (\`NOT_FOUND\` / \`DENIED\`). 403 means the workflow isn't assigned to your roles — ask the operator to assign it, do not work around it.
+
+## Authoring workflows is OPERATOR work
+- \`workflows_create\` / \`workflows_update\` / \`workflows_delete\` mutate the catalog. Do NOT call these on your own initiative. Only call when the operator EXPLICITLY hands a workflow body for codification or asks for a workflow to be retired.
+- Always \`dry_run=true\` first for create/update. Always include an \`approval_note\` for delete.
 `;
 
 // ---------------------------------------------------------------------------
@@ -736,8 +779,8 @@ async function main(): Promise<void> {
   // just point the LLM at the operator playbook.
   const accountHints = buildAccountHints<{ id: string; label?: string }>([], {
     baseInstructions:
-      "Workflows MCP — governed access to the MediaDevoted workflow playbook catalog. RBAC-gated read + write tools over the agent-platform `/workflows` API.",
-    grantHint: "All callers see the workflow catalog scoped to roles they hold. To author workflows, the caller needs MANAGE_WORKFLOWS.",
+      "Workflows MCP — governed access to the MediaDevoted workflow playbook catalog. RBAC-gated read + write tools over the agent-platform `/workflows` API. workflows BEAT memory: procedural intents (rotate / onboard / revalidate / audit / launch / cutover) MUST hit workflows_search first.",
+    grantHint: "All callers see the workflow catalog scoped to roles they hold. To author workflows, the caller needs MANAGE_WORKFLOWS — authoring is operator work, not agent initiative.",
   });
   const instructions = `${accountHints}\n\n${WORKFLOWS_OPERATOR_PLAYBOOK}`;
 
