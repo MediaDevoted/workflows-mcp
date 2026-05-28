@@ -40,6 +40,11 @@ services:
       EMBEDDINGS_SYNC_INTERVAL_MS: ${EMBEDDINGS_SYNC_INTERVAL_MS:-300000}
       EMBEDDINGS_BATCH_SIZE: ${EMBEDDINGS_BATCH_SIZE:-50}
       MCP_DYNAMIC_TOOLSETS: ${MCP_DYNAMIC_TOOLSETS:-}
+      # execute_tool guardrail (mcp-passthrough >=2.5.0). `1` refuses
+      # execute_tool on a directly-callable (_default-pinned) tool and
+      # steers the model to call it directly. Default off; set in the
+      # Komodo UI (stripped on redeploy like MCP_DYNAMIC_TOOLSETS).
+      MCP_EXECUTE_REDIRECT_PINNED: ${MCP_EXECUTE_REDIRECT_PINNED:-}
     networks:
       - default
       - shared-internal
