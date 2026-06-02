@@ -70,8 +70,9 @@ test("scoreWorkflow still ranks real queries correctly", () => {
 
 // -----------------------------------------------------------------------------
 // Handler-level regression: the in-process `workflows_search` handler MUST NOT
-// crash when called with an empty args object — Hermes hits this path through
-// dynamic-toolsets-v2's `execute_tool`, which bypasses the Zod schema.
+// crash when called with an empty args object — defensive coercion at the top
+// of the handler is what keeps a missing/non-string `query` from blowing up
+// the embeddings client or `scoreWorkflow`.
 // -----------------------------------------------------------------------------
 
 function buildServerWithWorkflowsTools(): McpServer {
