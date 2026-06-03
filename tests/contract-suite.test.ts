@@ -17,8 +17,6 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   runContractSuite,
   formatContractSuiteSummary,
-  DynamicToolsetV2Controller,
-  META_TOOL_SCHEMAS_V2,
   registerCommonResources,
   type ContractMcpClient,
   type ContractMcpTool,
@@ -123,59 +121,15 @@ test("contract-suite: workflows-mcp passes every fleet check", async () => {
     () => buildManifest(),
   );
 
-  // v2 meta-tools — register the same way `runMcpServer` does at the runtime
-  // layer. We register them in-process so the contract suite finds them.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const registerMetaTool = (server as any).registerTool.bind(server) as (
-    name: string,
-    config: Record<string, unknown>,
-    handler: (...args: unknown[]) => unknown,
-  ) => unknown;
-  const controller = new DynamicToolsetV2Controller({ serverLabel: "workflows MCP" });
-  for (const name of TOOL_NAMES) controller.setToolsetOverride(name, "workflows");
-  for (const meta of [
-    META_TOOL_SCHEMAS_V2.search_tools,
-    META_TOOL_SCHEMAS_V2.describe_tools,
-    META_TOOL_SCHEMAS_V2.execute_tool,
-  ]) {
-    controller.setToolsetOverride(meta.name, "_default");
-  }
-
-  registerMetaTool(
-    META_TOOL_SCHEMAS_V2.search_tools.name,
-    {
-      description: controller.renderSearchToolDescription(server as unknown),
-      inputSchema: {},
-    },
-    async (args: Record<string, unknown>) => {
-      const query = String(args.query ?? "").trim();
-      if (!query) {
-        return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "query_required" }) }] };
-      }
-      const limit = typeof args.limit === "number" ? args.limit : 10;
-      const hits = controller.search(server as unknown, query, limit);
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify({ ok: true, query, count: hits.length, results: hits }) }],
-      };
-    },
-  );
-  registerMetaTool(
-    META_TOOL_SCHEMAS_V2.describe_tools.name,
-    { description: META_TOOL_SCHEMAS_V2.describe_tools.description, inputSchema: {} },
-    async () => ({ content: [{ type: "text" as const, text: JSON.stringify({ ok: true, tools: [] }) }] }),
-  );
-  registerMetaTool(
-    META_TOOL_SCHEMAS_V2.execute_tool.name,
-    { description: META_TOOL_SCHEMAS_V2.execute_tool.description, inputSchema: {} },
-    async () => ({ content: [{ type: "text" as const, text: JSON.stringify({ ok: true }) }] }),
-  );
+  // No v2 meta-tools post-v3: Hermes Tool Search owns progressive disclosure
+  // client-side now. Every workflow tool is exposed flat to the MCP client.
 
   const client = buildDirectClient(server, instructions);
   const result = await runContractSuite({
     spawn: async () => client,
     connector: "workflows",
-    // 7 workflow tools + 3 v2 meta-tools = 10 minimum.
-    expectedMinTools: TOOL_NAMES.length + 3,
+    // 7 workflow tools — no v2 meta-tools.
+    expectedMinTools: TOOL_NAMES.length,
   });
 
   if (result.failed > 0) {

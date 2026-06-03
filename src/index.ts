@@ -3,10 +3,14 @@
  * Workflows MCP server — v0.2.
  *
  * Migrated from the bespoke 1.x bootstrap to the shared v2 runtime in
- * `@mediadevoted/mcp-passthrough`. Transport/session/auth/dynamic-toolsets
- * wiring lives in `runMcpServer`; this file only owns the connector-specific
- * pieces: identity client, audit-trail client, workflow tool registration,
- * resources, and the optional pgvector-backed semantic search.
+ * `@mediadevoted/mcp-passthrough`. Transport/session/auth wiring lives in
+ * `runMcpServer`; this file only owns the connector-specific pieces:
+ * identity client, audit-trail client, workflow tool registration, resources,
+ * and the optional pgvector-backed semantic search.
+ *
+ * Progressive disclosure (search_tools / describe_tools / execute_tool) is no
+ * longer owned by mcp-passthrough — Hermes Tool Search handles it client-side
+ * on v0.15.1+. All workflow tools are exposed flat to the MCP client.
  *
  * workflows-mcp is the canonical store for team/account conventions and
  * playbooks consumed at runtime by other MCPs. The tool API
@@ -18,7 +22,6 @@
 import {
   buildAccountHints,
   CostTracker,
-  DynamicToolsetV2Controller,
   EmployeeIdentityClient,
   err,
   errors,
@@ -100,27 +103,6 @@ const toolVisibility = new ToolVisibilityClient({
   connector: CONNECTOR,
   log: (m) => log(`[tool-visibility] ${m}`),
 });
-
-const dynamicToolsets = new DynamicToolsetV2Controller({
-  serverLabel: "workflows MCP",
-  log: (m) => log(`[dynamic-toolsets-v2] ${m}`),
-});
-dynamicToolsets.setCategoryMeta("workflows", {
-  examples: ["list workflows", "search workflows for cloudflare rotation", "read a workflow playbook"],
-});
-
-// Pin every workflow tool to `_default` so they're always visible alongside
-// the v2 meta-tools at session start. workflows-mcp is operator-procedural by
-// nature — the entire surface is small (7 tools) and routes from procedural
-// intents in SOUL.md, so progressive disclosure would just add a
-// search_tools → describe_tools → call round-trip for every workflow lookup.
-// Keeping them in `_default` removes that ~7.5s + 4500-token tax per turn.
-//
-// The three v2 meta-tools (search_tools, describe_tools, execute_tool) are
-// pinned to `_default` automatically by runMcpServer.
-for (const name of TOOL_NAMES) {
-  dynamicToolsets.setToolsetOverride(name, "_default");
-}
 
 const costTracker = new CostTracker();
 
@@ -415,10 +397,10 @@ function registerSearch(ctx: RegisterToolsContext): void {
       mode: z.enum(["fast", "deep"]).optional().describe("'fast' ranks on title/description/triggers (default); 'deep' blends in the full body."),
     },
     async (raw) => {
-      // Defensive: dynamic-toolsets-v2's execute_tool forwards args to handlers
-      // bypassing Zod, so we coerce here. Without these guards, a missing/
-      // non-string `query` crashed in `scoreWorkflow` and the embeddings
-      // client.
+      // Defensive coercion — older callers occasionally pass `query` as
+      // non-string (e.g. when the LLM forgets to quote it). Coerce up front so
+      // a missing/non-string value doesn't crash `scoreWorkflow` or the
+      // embeddings client.
       const safeQuery = typeof raw.query === "string" ? raw.query.trim() : "";
       const safeLimit = typeof raw.limit === "number" && Number.isFinite(raw.limit) ? Math.min(Math.max(1, Math.trunc(raw.limit)), 20) : 5;
       const safeMode: SearchMode = raw.mode === "deep" ? "deep" : "fast";
@@ -792,7 +774,6 @@ async function main(): Promise<void> {
     mcpAuthToken: config.mcpAuthToken,
     identity,
     adminPermissions: config.adminPermissions,
-    dynamicToolsets,
     toolVisibility,
     costTracker,
     instructions,
